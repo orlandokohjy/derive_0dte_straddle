@@ -1,0 +1,13 @@
+services:
+  algo:
+    build: .
+    container_name: derive_0dte_straddle
+    restart: always
+    env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=UTC
+      - ENTRY_NOW=${ENTRY_NOW:-false}
+    volumes:
+      - ./state:/app/state
+      - ./logs:/app/logs
