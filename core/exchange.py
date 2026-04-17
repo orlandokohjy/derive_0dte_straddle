@@ -255,6 +255,8 @@ class DeriveExchange:
         Escalating maker buy: start at bid, walk up by 1 tick per attempt.
 
         Never crosses the spread (capped at ask - 1 tick).
+        Partial fills are accumulated and the chase continues for the
+        remaining quantity.
         """
         if config.DRY_RUN:
             return {"order_id": f"dry-{uuid.uuid4().hex[:12]}",
@@ -262,8 +264,14 @@ class DeriveExchange:
 
         log.info("chase_buy_maker", instrument=instrument, qty=qty)
         tick = config.OPTION_TICK_SIZE
+        remaining_qty = qty
+        weighted_cost = 0.0
+        total_filled = 0.0
 
         for attempt in range(config.OPTION_CHASE_MAX_ATTEMPTS):
+            if remaining_qty <= 0:
+                break
+
             ticker = await self.get_ticker(instrument)
 
             if ticker.bid > 0:
@@ -276,50 +284,76 @@ class DeriveExchange:
             price = _round_price(base_price + tick * attempt, "up")
             price = min(price, _round_price(ceiling, "up"))
 
-            result = await self._place_limit_order(instrument, "buy", qty, price)
+            result = await self._place_limit_order(instrument, "buy", remaining_qty, price)
             order_id = result.get("order_id", "")
             if not order_id:
                 break
 
             if result.get("order_status") == "filled":
                 fill_price = float(result.get("average_price", price))
+                weighted_cost += fill_price * remaining_qty
+                total_filled += remaining_qty
+                avg_price = weighted_cost / total_filled
                 log.info("chase_filled_immediate", instrument=instrument,
-                         price=fill_price, attempt=attempt + 1)
+                         price=fill_price, total_filled=total_filled,
+                         attempt=attempt + 1)
                 return {"order_id": order_id, "order_status": "filled",
-                        "average_price": str(fill_price)}
+                        "average_price": str(avg_price)}
 
             fill = await self._wait_fill(order_id,
                                          timeout=config.OPTION_CHASE_INTERVAL_SEC)
 
             if fill and fill.get("order_status") == "filled":
                 fill_price = float(fill.get("average_price", price))
+                weighted_cost += fill_price * remaining_qty
+                total_filled += remaining_qty
+                avg_price = weighted_cost / total_filled
                 log.info("chase_filled", instrument=instrument,
-                         price=fill_price, attempt=attempt + 1)
+                         price=fill_price, total_filled=total_filled,
+                         attempt=attempt + 1)
                 return {"order_id": order_id, "order_status": "filled",
-                        "average_price": str(fill_price)}
+                        "average_price": str(avg_price)}
 
             await self.cancel_order(order_id, instrument)
 
             final = await self._get_order(order_id)
             if final.get("order_status") == "filled":
                 fill_price = float(final.get("average_price", price))
+                weighted_cost += fill_price * remaining_qty
+                total_filled += remaining_qty
+                avg_price = weighted_cost / total_filled
                 log.info("chase_filled_post_cancel", instrument=instrument,
-                         price=fill_price, attempt=attempt + 1)
+                         price=fill_price, total_filled=total_filled,
+                         attempt=attempt + 1)
                 return {"order_id": order_id, "order_status": "filled",
-                        "average_price": str(fill_price)}
+                        "average_price": str(avg_price)}
 
             filled_amt = float(final.get("filled_amount", 0) or 0)
             if filled_amt > 0:
                 fill_price = float(final.get("average_price", price))
-                log.info("chase_partial_post_cancel", instrument=instrument,
-                         price=fill_price, filled=filled_amt, attempt=attempt + 1)
-                return {"order_id": order_id, "order_status": "filled",
-                        "average_price": str(fill_price)}
+                weighted_cost += fill_price * filled_amt
+                total_filled += filled_amt
+                remaining_qty -= filled_amt
+                remaining_qty = round(remaining_qty, 8)
+
+                if remaining_qty <= 0:
+                    avg_price = weighted_cost / total_filled
+                    log.info("chase_filled_post_cancel", instrument=instrument,
+                             price=fill_price, total_filled=total_filled,
+                             attempt=attempt + 1)
+                    return {"order_id": order_id, "order_status": "filled",
+                            "average_price": str(avg_price)}
+
+                log.info("chase_partial_fill", instrument=instrument,
+                         filled=filled_amt, remaining=remaining_qty,
+                         attempt=attempt + 1)
 
             log.debug("chase_reprice", instrument=instrument,
-                      attempt=attempt + 1, price=price)
+                      attempt=attempt + 1, remaining_qty=remaining_qty,
+                      price=price)
 
-        log.warning("chase_exhausted", instrument=instrument)
+        log.warning("chase_exhausted", instrument=instrument,
+                    total_filled=total_filled, remaining=remaining_qty)
         return None
 
     # ──────────────────── Chase Sell (Escalating Maker) ───────────
@@ -331,6 +365,8 @@ class DeriveExchange:
         Escalating maker sell: start at ask, walk down by 1 tick per attempt.
 
         Never crosses the spread (capped at bid + 1 tick).
+        Partial fills are accumulated and the chase continues for the
+        remaining quantity.
         """
         if config.DRY_RUN:
             return {"order_id": f"dry-{uuid.uuid4().hex[:12]}",
@@ -338,8 +374,14 @@ class DeriveExchange:
 
         log.info("chase_sell_maker", instrument=instrument, qty=qty)
         tick = config.OPTION_TICK_SIZE
+        remaining_qty = qty
+        weighted_revenue = 0.0
+        total_filled = 0.0
 
         for attempt in range(config.OPTION_CHASE_MAX_ATTEMPTS):
+            if remaining_qty <= 0:
+                break
+
             ticker = await self.get_ticker(instrument)
 
             if ticker.ask > 0:
@@ -354,48 +396,74 @@ class DeriveExchange:
             if price <= 0:
                 price = tick
 
-            result = await self._place_limit_order(instrument, "sell", qty, price)
+            result = await self._place_limit_order(instrument, "sell", remaining_qty, price)
             order_id = result.get("order_id", "")
             if not order_id:
                 break
 
             if result.get("order_status") == "filled":
                 fill_price = float(result.get("average_price", price))
+                weighted_revenue += fill_price * remaining_qty
+                total_filled += remaining_qty
+                avg_price = weighted_revenue / total_filled
                 log.info("chase_sell_filled_immediate", instrument=instrument,
-                         price=fill_price, attempt=attempt + 1)
+                         price=fill_price, total_filled=total_filled,
+                         attempt=attempt + 1)
                 return {"order_id": order_id, "order_status": "filled",
-                        "average_price": str(fill_price)}
+                        "average_price": str(avg_price)}
 
             fill = await self._wait_fill(order_id,
                                          timeout=config.OPTION_CHASE_INTERVAL_SEC)
 
             if fill and fill.get("order_status") == "filled":
                 fill_price = float(fill.get("average_price", price))
+                weighted_revenue += fill_price * remaining_qty
+                total_filled += remaining_qty
+                avg_price = weighted_revenue / total_filled
                 log.info("chase_sell_filled", instrument=instrument,
-                         price=fill_price, attempt=attempt + 1)
+                         price=fill_price, total_filled=total_filled,
+                         attempt=attempt + 1)
                 return {"order_id": order_id, "order_status": "filled",
-                        "average_price": str(fill_price)}
+                        "average_price": str(avg_price)}
 
             await self.cancel_order(order_id, instrument)
 
             final = await self._get_order(order_id)
             if final.get("order_status") == "filled":
                 fill_price = float(final.get("average_price", price))
+                weighted_revenue += fill_price * remaining_qty
+                total_filled += remaining_qty
+                avg_price = weighted_revenue / total_filled
                 log.info("chase_sell_filled_post_cancel", instrument=instrument,
-                         price=fill_price, attempt=attempt + 1)
+                         price=fill_price, total_filled=total_filled,
+                         attempt=attempt + 1)
                 return {"order_id": order_id, "order_status": "filled",
-                        "average_price": str(fill_price)}
+                        "average_price": str(avg_price)}
 
             filled_amt = float(final.get("filled_amount", 0) or 0)
             if filled_amt > 0:
                 fill_price = float(final.get("average_price", price))
-                log.info("chase_sell_partial_post_cancel", instrument=instrument,
-                         price=fill_price, filled=filled_amt, attempt=attempt + 1)
-                return {"order_id": order_id, "order_status": "filled",
-                        "average_price": str(fill_price)}
+                weighted_revenue += fill_price * filled_amt
+                total_filled += filled_amt
+                remaining_qty -= filled_amt
+                remaining_qty = round(remaining_qty, 8)
+
+                if remaining_qty <= 0:
+                    avg_price = weighted_revenue / total_filled
+                    log.info("chase_sell_filled_post_cancel", instrument=instrument,
+                             price=fill_price, total_filled=total_filled,
+                             attempt=attempt + 1)
+                    return {"order_id": order_id, "order_status": "filled",
+                            "average_price": str(avg_price)}
+
+                log.info("chase_sell_partial_fill", instrument=instrument,
+                         filled=filled_amt, remaining=remaining_qty,
+                         attempt=attempt + 1)
 
             log.debug("chase_sell_reprice", instrument=instrument,
-                      attempt=attempt + 1, price=price)
+                      attempt=attempt + 1, remaining_qty=remaining_qty,
+                      price=price)
 
-        log.warning("chase_sell_exhausted", instrument=instrument)
+        log.warning("chase_sell_exhausted", instrument=instrument,
+                    total_filled=total_filled, remaining=remaining_qty)
         return None
