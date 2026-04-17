@@ -551,7 +551,8 @@ class DeriveExchange:
         Send an RFQ for a straddle (buy call + buy put) and execute the
         best quote. Returns fill details or None on failure.
         """
-        from derive_client.data_types import LegUnpricedSchema, Direction, D
+        from derive_client.data_types.generated_models import LegUnpricedSchema, Direction
+        from derive_client.data_types import D
 
         legs = [
             LegUnpricedSchema(
@@ -599,7 +600,6 @@ class DeriveExchange:
                        for l in quote_legs])
 
         try:
-            from derive_client.data_types import LegPricedSchema
             exec_result = await asyncio.get_running_loop().run_in_executor(
                 None, lambda: self._client.active_subaccount.rfq.execute_quote(
                     direction=Direction.buy,
@@ -638,7 +638,8 @@ class DeriveExchange:
         self, call_instrument: str, put_instrument: str, qty: float,
     ) -> dict | None:
         """Send an RFQ to sell a straddle (sell call + sell put)."""
-        from derive_client.data_types import LegUnpricedSchema, Direction, D
+        from derive_client.data_types.generated_models import LegUnpricedSchema, Direction
+        from derive_client.data_types import D
 
         legs = [
             LegUnpricedSchema(
