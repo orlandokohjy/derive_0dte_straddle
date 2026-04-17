@@ -34,6 +34,7 @@ QTY_PER_LEG: float = float(os.getenv("QTY_PER_LEG", "1.0"))
 
 INITIAL_CAPITAL_USD: float = float(os.getenv("INITIAL_CAPITAL_USD", "8000.0"))
 ALLOC_PCT: float = 0.80
+NUM_STRADDLES_OVERRIDE: int = int(os.getenv("NUM_STRADDLES_OVERRIDE", "0"))  # >0 forces exact count
 
 # ──────────────────── Session Schedule (UTC) ──────────────────────
 SESSION_ENTRY_UTC: time = time(14, 0)

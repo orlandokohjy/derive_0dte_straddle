@@ -144,6 +144,13 @@ class Algo:
         equity = self.portfolio.equity
         sizing = size_position(equity, pair.call.ask, pair.put.ask)
 
+        if config.NUM_STRADDLES_OVERRIDE > 0:
+            sizing.num_straddles = config.NUM_STRADDLES_OVERRIDE
+            sizing.total_call_cost = sizing.call_cost_per * sizing.num_straddles
+            sizing.total_put_cost = sizing.put_cost_per * sizing.num_straddles
+            sizing.total_capital_required = (sizing.total_call_cost + sizing.total_put_cost) * 1.05
+            log.info("straddles_override", forced=config.NUM_STRADDLES_OVERRIDE)
+
         if sizing.num_straddles == 0:
             msg = (
                 f"Insufficient capital for even 1 straddle.\n"
