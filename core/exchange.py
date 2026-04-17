@@ -356,7 +356,41 @@ class DeriveExchange:
                       attempt=attempt + 1, remaining_qty=remaining_qty,
                       price=price)
 
-        log.warning("chase_exhausted", instrument=instrument,
+        # ── Taker fallback: place at the ask to guarantee fill ──
+        if remaining_qty > 0:
+            log.warning("chase_buy_maker_exhausted_trying_taker", instrument=instrument,
+                        remaining_qty=remaining_qty)
+            ticker = await self.get_ticker(instrument)
+            taker_price = _round_price(
+                ticker.ask if ticker.ask > 0 else initial_bid + tick * 20, "up")
+
+            result = await self._place_limit_order(instrument, "buy", remaining_qty, taker_price)
+            order_id = result.get("order_id", "")
+            if order_id:
+                if result.get("order_status") == "filled":
+                    fill_price = float(result.get("average_price", taker_price))
+                    weighted_cost += fill_price * remaining_qty
+                    total_filled += remaining_qty
+                    avg_price = weighted_cost / total_filled
+                    log.info("chase_buy_taker_filled", instrument=instrument,
+                             price=fill_price, total_filled=total_filled)
+                    return {"order_id": order_id, "order_status": "filled",
+                            "average_price": str(avg_price)}
+
+                fill = await self._wait_fill(order_id, timeout=10.0)
+                if fill and fill.get("order_status") == "filled":
+                    fill_price = float(fill.get("average_price", taker_price))
+                    weighted_cost += fill_price * remaining_qty
+                    total_filled += remaining_qty
+                    avg_price = weighted_cost / total_filled
+                    log.info("chase_buy_taker_filled", instrument=instrument,
+                             price=fill_price, total_filled=total_filled)
+                    return {"order_id": order_id, "order_status": "filled",
+                            "average_price": str(avg_price)}
+
+                await self.cancel_order(order_id, instrument)
+
+        log.warning("chase_exhausted_including_taker", instrument=instrument,
                     total_filled=total_filled, remaining=remaining_qty)
         return None
 
@@ -468,6 +502,42 @@ class DeriveExchange:
                       attempt=attempt + 1, remaining_qty=remaining_qty,
                       price=price)
 
-        log.warning("chase_sell_exhausted", instrument=instrument,
+        # ── Taker fallback: place at the bid to guarantee fill ──
+        if remaining_qty > 0:
+            log.warning("chase_sell_maker_exhausted_trying_taker", instrument=instrument,
+                        remaining_qty=remaining_qty)
+            ticker = await self.get_ticker(instrument)
+            taker_price = _round_price(
+                ticker.bid if ticker.bid > 0 else initial_ask - tick * 20, "down")
+            if taker_price <= 0:
+                taker_price = tick
+
+            result = await self._place_limit_order(instrument, "sell", remaining_qty, taker_price)
+            order_id = result.get("order_id", "")
+            if order_id:
+                if result.get("order_status") == "filled":
+                    fill_price = float(result.get("average_price", taker_price))
+                    weighted_revenue += fill_price * remaining_qty
+                    total_filled += remaining_qty
+                    avg_price = weighted_revenue / total_filled
+                    log.info("chase_sell_taker_filled", instrument=instrument,
+                             price=fill_price, total_filled=total_filled)
+                    return {"order_id": order_id, "order_status": "filled",
+                            "average_price": str(avg_price)}
+
+                fill = await self._wait_fill(order_id, timeout=10.0)
+                if fill and fill.get("order_status") == "filled":
+                    fill_price = float(fill.get("average_price", taker_price))
+                    weighted_revenue += fill_price * remaining_qty
+                    total_filled += remaining_qty
+                    avg_price = weighted_revenue / total_filled
+                    log.info("chase_sell_taker_filled", instrument=instrument,
+                             price=fill_price, total_filled=total_filled)
+                    return {"order_id": order_id, "order_status": "filled",
+                            "average_price": str(avg_price)}
+
+                await self.cancel_order(order_id, instrument)
+
+        log.warning("chase_sell_exhausted_including_taker", instrument=instrument,
                     total_filled=total_filled, remaining=remaining_qty)
         return None
