@@ -1,10 +1,11 @@
 """
-Atomic straddle construction and teardown.
+Atomic straddle construction and teardown via RFQ.
 
 One straddle = 1 ITM call + 1 put (same strike) per QTY_PER_LEG BTC.
 
-Entry: call first (GTC limit at bid — maker) → put (GTC limit at bid — maker)
-Exit:  call first (GTC limit at ask — maker) → put (GTC limit at ask — maker)
+Entry: RFQ (buy call + buy put) → atomic fill
+Exit:  RFQ (sell call + sell put) → atomic fill
+Fallback: individual leg chasing if RFQ fails.
 """
 from __future__ import annotations
 
@@ -34,50 +35,76 @@ async def build_straddle(
     """
     Execute the atomic entry for N identical straddle units.
 
-    1. Buy call: QTY_PER_LEG × num_straddles BTC
-    2. Buy put:  QTY_PER_LEG × num_straddles BTC
-    3. Register straddle in portfolio
+    Primary: RFQ for both legs atomically.
+    Fallback: individual leg chasing if RFQ produces no quotes.
     """
     straddle_id = f"D0-{uuid.uuid4().hex[:8]}"
     total_qty = config.QTY_PER_LEG * num_straddles
 
     log.info("building_straddle", id=straddle_id, strike=pair.strike,
-             call=pair.call.symbol, put=pair.put.symbol, num=num_straddles)
+             call=pair.call.symbol, put=pair.put.symbol, num=num_straddles,
+             method="rfq")
 
-    # ── Step 1: Buy call (GTC limit at bid — maker) ──
-    call_result = await exchange.chase_buy(pair.call.symbol, total_qty, pair.call.bid)
-    if call_result is None:
-        log.error("call_buy_failed", id=straddle_id, symbol=pair.call.symbol)
-        return None
+    # ── Primary: RFQ atomic entry ──
+    rfq_result = await exchange.send_rfq(
+        pair.call.symbol, pair.put.symbol, total_qty)
 
-    call_fill = float(call_result.get("average_price", pair.call.bid))
-    call_order_id = call_result.get("order_id", "")
-    log.info("call_filled", id=straddle_id, price=call_fill, order_id=call_order_id)
+    if rfq_result is not None:
+        call_fill = rfq_result["call_price"]
+        put_fill = rfq_result["put_price"]
+        rfq_id = rfq_result["rfq_id"]
 
-    call_leg = StraddleLeg(
-        instrument=pair.call.symbol, side="Buy",
-        qty=total_qty, entry_price=call_fill,
-        order_id=call_order_id, avg_fill_price=call_fill,
-    )
+        log.info("rfq_straddle_filled", id=straddle_id, rfq_id=rfq_id,
+                 call_price=call_fill, put_price=put_fill)
 
-    # ── Step 2: Buy put (GTC limit at bid — maker) ──
-    put_result = await exchange.chase_buy(pair.put.symbol, total_qty, pair.put.bid)
-    if put_result is None:
-        log.error("put_buy_failed", id=straddle_id, symbol=pair.put.symbol)
-        await _emergency_sell(exchange, pair.call.symbol, total_qty, call_fill)
-        return None
+        call_leg = StraddleLeg(
+            instrument=pair.call.symbol, side="Buy",
+            qty=total_qty, entry_price=call_fill,
+            order_id=rfq_id, avg_fill_price=call_fill,
+        )
+        put_leg = StraddleLeg(
+            instrument=pair.put.symbol, side="Buy",
+            qty=total_qty, entry_price=put_fill,
+            order_id=rfq_id, avg_fill_price=put_fill,
+        )
+    else:
+        # ── Fallback: individual leg chasing ──
+        log.warning("rfq_failed_fallback_to_chase", id=straddle_id)
 
-    put_fill = float(put_result.get("average_price", pair.put.bid))
-    put_order_id = put_result.get("order_id", "")
-    log.info("put_filled", id=straddle_id, price=put_fill, order_id=put_order_id)
+        call_result = await exchange.chase_buy(
+            pair.call.symbol, total_qty, pair.call.bid)
+        if call_result is None:
+            log.error("call_buy_failed", id=straddle_id, symbol=pair.call.symbol)
+            return None
 
-    put_leg = StraddleLeg(
-        instrument=pair.put.symbol, side="Buy",
-        qty=total_qty, entry_price=put_fill,
-        order_id=put_order_id, avg_fill_price=put_fill,
-    )
+        call_fill = float(call_result.get("average_price", pair.call.bid))
+        log.info("call_filled", id=straddle_id, price=call_fill)
 
-    # ── Step 3: Register ──
+        call_leg = StraddleLeg(
+            instrument=pair.call.symbol, side="Buy",
+            qty=total_qty, entry_price=call_fill,
+            order_id=call_result.get("order_id", ""),
+            avg_fill_price=call_fill,
+        )
+
+        put_result = await exchange.chase_buy(
+            pair.put.symbol, total_qty, pair.put.bid)
+        if put_result is None:
+            log.error("put_buy_failed", id=straddle_id, symbol=pair.put.symbol)
+            await _emergency_sell(exchange, pair.call.symbol, total_qty, call_fill)
+            return None
+
+        put_fill = float(put_result.get("average_price", pair.put.bid))
+        log.info("put_filled", id=straddle_id, price=put_fill)
+
+        put_leg = StraddleLeg(
+            instrument=pair.put.symbol, side="Buy",
+            qty=total_qty, entry_price=put_fill,
+            order_id=put_result.get("order_id", ""),
+            avg_fill_price=put_fill,
+        )
+
+    # ── Register ──
     straddle_cost = config.QTY_PER_LEG * (call_fill + put_fill)
 
     straddle = Straddle(
@@ -107,44 +134,55 @@ async def unwind_straddle(
     reason: str = "hard_close",
 ) -> float:
     """
-    Close the open straddle: sell call first, then sell put.
-    Returns the P&L.
+    Close the open straddle.
+    Primary: RFQ sell both legs atomically.
+    Fallback: individual leg chasing.
     """
     straddle = portfolio.open_straddle
     if straddle is None:
         return 0.0
 
-    log.info("unwinding", id=straddle.id, reason=reason)
+    log.info("unwinding", id=straddle.id, reason=reason, method="rfq")
 
-    # ── Sell call (GTC limit at ask — maker) ──
-    exit_call_price = straddle.entry_call_price
-    _, call_ask = await market.get_option_bid_ask(straddle.call_leg.instrument)
-    if call_ask > 0:
-        result = await exchange.chase_sell(
-            straddle.call_leg.instrument, straddle.call_leg.qty, call_ask,
-        )
-        if result:
-            exit_call_price = float(result.get("average_price", call_ask))
-            log.info("call_sold", price=exit_call_price)
-        else:
-            log.warning("call_sell_failed", instrument=straddle.call_leg.instrument)
-    else:
-        log.warning("call_no_ask", instrument=straddle.call_leg.instrument)
+    # ── Primary: RFQ atomic exit ──
+    rfq_result = await exchange.send_rfq_sell(
+        straddle.call_leg.instrument,
+        straddle.put_leg.instrument,
+        straddle.call_leg.qty,
+    )
 
-    # ── Sell put (GTC limit at ask — maker) ──
-    exit_put_price = straddle.entry_put_price
-    _, put_ask = await market.get_option_bid_ask(straddle.put_leg.instrument)
-    if put_ask > 0:
-        result = await exchange.chase_sell(
-            straddle.put_leg.instrument, straddle.put_leg.qty, put_ask,
-        )
-        if result:
-            exit_put_price = float(result.get("average_price", put_ask))
-            log.info("put_sold", price=exit_put_price)
-        else:
-            log.warning("put_sell_failed", instrument=straddle.put_leg.instrument)
+    if rfq_result is not None:
+        exit_call_price = rfq_result["call_price"]
+        exit_put_price = rfq_result["put_price"]
+        log.info("rfq_unwind_filled", id=straddle.id,
+                 call_exit=exit_call_price, put_exit=exit_put_price)
     else:
-        log.warning("put_no_ask", instrument=straddle.put_leg.instrument)
+        # ── Fallback: individual leg chasing ──
+        log.warning("rfq_sell_failed_fallback_to_chase", id=straddle.id)
+
+        exit_call_price = straddle.entry_call_price
+        _, call_ask = await market.get_option_bid_ask(straddle.call_leg.instrument)
+        if call_ask > 0:
+            result = await exchange.chase_sell(
+                straddle.call_leg.instrument, straddle.call_leg.qty, call_ask)
+            if result:
+                exit_call_price = float(result.get("average_price", call_ask))
+                log.info("call_sold", price=exit_call_price)
+            else:
+                log.warning("call_sell_failed",
+                            instrument=straddle.call_leg.instrument)
+
+        exit_put_price = straddle.entry_put_price
+        _, put_ask = await market.get_option_bid_ask(straddle.put_leg.instrument)
+        if put_ask > 0:
+            result = await exchange.chase_sell(
+                straddle.put_leg.instrument, straddle.put_leg.qty, put_ask)
+            if result:
+                exit_put_price = float(result.get("average_price", put_ask))
+                log.info("put_sold", price=exit_put_price)
+            else:
+                log.warning("put_sell_failed",
+                            instrument=straddle.put_leg.instrument)
 
     pnl = portfolio.close_straddle(exit_call_price, exit_put_price, reason)
     log.info("straddle_unwound", id=straddle.id, reason=reason,

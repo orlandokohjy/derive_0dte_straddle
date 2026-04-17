@@ -541,3 +541,214 @@ class DeriveExchange:
         log.warning("chase_sell_exhausted_including_taker", instrument=instrument,
                     total_filled=total_filled, remaining=remaining_qty)
         return None
+
+    # ──────────────────── RFQ (Atomic Multi-Leg) ───────────────────
+
+    async def send_rfq(
+        self, call_instrument: str, put_instrument: str, qty: float,
+    ) -> dict | None:
+        """
+        Send an RFQ for a straddle (buy call + buy put) and execute the
+        best quote. Returns fill details or None on failure.
+        """
+        from derive_client.data_types import LegUnpricedSchema, Direction, D
+
+        legs = [
+            LegUnpricedSchema(
+                instrument_name=call_instrument,
+                amount=D(str(qty)),
+                direction=Direction.buy,
+            ),
+            LegUnpricedSchema(
+                instrument_name=put_instrument,
+                amount=D(str(qty)),
+                direction=Direction.buy,
+            ),
+        ]
+
+        log.info("rfq_send", call=call_instrument, put=put_instrument, qty=qty)
+
+        try:
+            rfq_result = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._client.active_subaccount.rfq.send_rfq(legs=legs)
+            )
+            rfq_id = getattr(rfq_result, "rfq_id", "")
+            log.info("rfq_created", rfq_id=rfq_id)
+        except Exception:
+            log.error("rfq_send_failed", exc_info=True)
+            self.error_count += 1
+            return None
+
+        best_quote = await self._poll_for_best_quote(rfq_id, legs, timeout=60.0)
+        if best_quote is None:
+            log.warning("rfq_no_quotes", rfq_id=rfq_id)
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: self._client.active_subaccount.rfq.cancel_rfq(
+                        rfq_id=rfq_id))
+            except Exception:
+                pass
+            return None
+
+        quote_id = getattr(best_quote, "quote_id", "")
+        quote_legs = getattr(best_quote, "legs", [])
+        direction = getattr(best_quote, "direction", None)
+
+        log.info("rfq_best_quote", rfq_id=rfq_id, quote_id=quote_id,
+                 legs=[f"{getattr(l, 'instrument_name', '?')}@{getattr(l, 'price', '?')}"
+                       for l in quote_legs])
+
+        try:
+            from derive_client.data_types import LegPricedSchema
+            exec_result = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._client.active_subaccount.rfq.execute_quote(
+                    direction=Direction.buy,
+                    legs=quote_legs,
+                    quote_id=quote_id,
+                    rfq_id=rfq_id,
+                )
+            )
+            status = str(getattr(exec_result, "status", ""))
+            log.info("rfq_executed", rfq_id=rfq_id, quote_id=quote_id, status=status)
+
+            call_price = 0.0
+            put_price = 0.0
+            for leg in quote_legs:
+                name = getattr(leg, "instrument_name", "")
+                price = float(getattr(leg, "price", 0))
+                if name.endswith("-C"):
+                    call_price = price
+                elif name.endswith("-P"):
+                    put_price = price
+
+            return {
+                "rfq_id": rfq_id,
+                "quote_id": quote_id,
+                "status": status,
+                "call_price": call_price,
+                "put_price": put_price,
+                "qty": qty,
+            }
+        except Exception:
+            log.error("rfq_execute_failed", rfq_id=rfq_id, exc_info=True)
+            self.error_count += 1
+            return None
+
+    async def send_rfq_sell(
+        self, call_instrument: str, put_instrument: str, qty: float,
+    ) -> dict | None:
+        """Send an RFQ to sell a straddle (sell call + sell put)."""
+        from derive_client.data_types import LegUnpricedSchema, Direction, D
+
+        legs = [
+            LegUnpricedSchema(
+                instrument_name=call_instrument,
+                amount=D(str(qty)),
+                direction=Direction.sell,
+            ),
+            LegUnpricedSchema(
+                instrument_name=put_instrument,
+                amount=D(str(qty)),
+                direction=Direction.sell,
+            ),
+        ]
+
+        log.info("rfq_sell_send", call=call_instrument, put=put_instrument, qty=qty)
+
+        try:
+            rfq_result = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._client.active_subaccount.rfq.send_rfq(legs=legs)
+            )
+            rfq_id = getattr(rfq_result, "rfq_id", "")
+            log.info("rfq_sell_created", rfq_id=rfq_id)
+        except Exception:
+            log.error("rfq_sell_send_failed", exc_info=True)
+            self.error_count += 1
+            return None
+
+        best_quote = await self._poll_for_best_quote(rfq_id, legs, timeout=60.0)
+        if best_quote is None:
+            log.warning("rfq_sell_no_quotes", rfq_id=rfq_id)
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: self._client.active_subaccount.rfq.cancel_rfq(
+                        rfq_id=rfq_id))
+            except Exception:
+                pass
+            return None
+
+        quote_id = getattr(best_quote, "quote_id", "")
+        quote_legs = getattr(best_quote, "legs", [])
+
+        log.info("rfq_sell_best_quote", rfq_id=rfq_id, quote_id=quote_id)
+
+        try:
+            exec_result = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._client.active_subaccount.rfq.execute_quote(
+                    direction=Direction.sell,
+                    legs=quote_legs,
+                    quote_id=quote_id,
+                    rfq_id=rfq_id,
+                )
+            )
+            status = str(getattr(exec_result, "status", ""))
+            log.info("rfq_sell_executed", rfq_id=rfq_id, status=status)
+
+            call_price = 0.0
+            put_price = 0.0
+            for leg in quote_legs:
+                name = getattr(leg, "instrument_name", "")
+                price = float(getattr(leg, "price", 0))
+                if name.endswith("-C"):
+                    call_price = price
+                elif name.endswith("-P"):
+                    put_price = price
+
+            return {
+                "rfq_id": rfq_id,
+                "quote_id": quote_id,
+                "status": status,
+                "call_price": call_price,
+                "put_price": put_price,
+                "qty": qty,
+            }
+        except Exception:
+            log.error("rfq_sell_execute_failed", rfq_id=rfq_id, exc_info=True)
+            self.error_count += 1
+            return None
+
+    async def _poll_for_best_quote(
+        self, rfq_id: str, legs, timeout: float = 60.0,
+    ):
+        """Poll for quotes on an RFQ until timeout. Returns best quote or None."""
+        from derive_client.data_types import Direction
+
+        deadline = _time.time() + timeout
+        best = None
+
+        while _time.time() < deadline:
+            await asyncio.sleep(2.0)
+            try:
+                quotes_result = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: self._client.active_subaccount.rfq.poll_quotes(
+                        rfq_id=rfq_id)
+                )
+                quotes = getattr(quotes_result, "quotes", [])
+                if quotes:
+                    best = quotes[0]
+                    for q in quotes[1:]:
+                        best_cost = sum(
+                            float(getattr(l, "price", 0)) * float(getattr(l, "amount", 0))
+                            for l in getattr(best, "legs", []))
+                        q_cost = sum(
+                            float(getattr(l, "price", 0)) * float(getattr(l, "amount", 0))
+                            for l in getattr(q, "legs", []))
+                        if q_cost < best_cost:
+                            best = q
+                    log.info("rfq_quotes_received", rfq_id=rfq_id,
+                             num_quotes=len(quotes))
+                    return best
+            except Exception:
+                log.debug("rfq_poll_error", rfq_id=rfq_id, exc_info=True)
+
+        return best
