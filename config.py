@@ -44,8 +44,8 @@ WEEKLY_REPORT_UTC: time = time(20, 0)
 ALLOWED_WEEKDAYS: set[int] = {0, 1, 2, 3, 4}  # Mon–Fri
 
 # ──────────────────── Execution Settings ──────────────────────────
-OPTION_CHASE_INTERVAL_SEC: float = 3.0
-OPTION_CHASE_MAX_ATTEMPTS: int = 25
+OPTION_CHASE_INTERVAL_SEC: float = 5.0
+OPTION_CHASE_MAX_ATTEMPTS: int = 60
 OPTION_TICK_SIZE: float = 5.0
 
 # ──────────────────── Risk Management ─────────────────────────────
