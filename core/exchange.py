@@ -66,19 +66,17 @@ class DeriveExchange:
     # ──────────────────── Market Data ─────────────────────────────
 
     async def get_ticker(self, instrument_name: str) -> TickerSnapshot:
-        """Fetch current bid/ask/mark for an instrument."""
+        """Fetch current bid/ask/mark for an instrument via bulk tickers."""
         try:
-            data = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: self._client.markets.get_ticker(
-                    instrument_name=instrument_name
-                )
-            )
-            return TickerSnapshot(
-                bid=float(getattr(data, "best_bid_price", 0) or 0),
-                ask=float(getattr(data, "best_ask_price", 0) or 0),
-                mark=float(getattr(data, "mark_price", 0) or 0),
-                index=float(getattr(data, "index_price", 0) or 0),
-            )
+            parts = instrument_name.split("-")
+            expiry = parts[1] if len(parts) >= 3 else ""
+            currency = parts[0] if parts else "BTC"
+
+            tickers = await self.get_tickers_for_expiry(currency, expiry)
+            if instrument_name in tickers:
+                return tickers[instrument_name]
+
+            return TickerSnapshot()
         except Exception:
             log.warning("get_ticker_failed", instrument=instrument_name, exc_info=True)
             self.error_count += 1
@@ -175,19 +173,25 @@ class DeriveExchange:
         self, instrument: str, direction: str, qty: float, price: float,
     ) -> dict:
         """Place a GTC limit order via derive-client (handles EIP-712 signing)."""
-        from derive_client.data_types import D, Direction, OrderType, TimeInForce
+        from derive_client.data_types import D, Direction, OrderType
 
         dir_enum = Direction.buy if direction == "buy" else Direction.sell
         try:
+            create_kwargs = dict(
+                instrument_name=instrument,
+                amount=D(str(qty)),
+                limit_price=D(str(price)),
+                direction=dir_enum,
+                order_type=OrderType.limit,
+            )
+            try:
+                from derive_client.data_types import TimeInForce
+                create_kwargs["time_in_force"] = TimeInForce.gtc
+            except ImportError:
+                create_kwargs["time_in_force"] = "gtc"
+
             result = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: self._client.orders.create(
-                    instrument_name=instrument,
-                    amount=D(str(qty)),
-                    limit_price=D(str(price)),
-                    direction=dir_enum,
-                    order_type=OrderType.limit,
-                    time_in_force=TimeInForce.gtc,
-                )
+                None, lambda: self._client.orders.create(**create_kwargs)
             )
             order_id = getattr(result, "order_id", "")
             status = getattr(result, "order_status", "")
