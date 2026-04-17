@@ -596,13 +596,15 @@ class DeriveExchange:
         direction = getattr(best_quote, "direction", None)
 
         log.info("rfq_best_quote", rfq_id=rfq_id, quote_id=quote_id,
+                 maker_direction=str(direction),
                  legs=[f"{getattr(l, 'instrument_name', '?')}@{getattr(l, 'price', '?')}"
                        for l in quote_legs])
 
+        taker_direction = Direction.sell if direction == Direction.buy else Direction.buy
         try:
             exec_result = await asyncio.get_running_loop().run_in_executor(
                 None, lambda: self._client.active_subaccount.rfq.execute_quote(
-                    direction=Direction.buy,
+                    direction=taker_direction,
                     legs=quote_legs,
                     quote_id=quote_id,
                     rfq_id=rfq_id,
@@ -680,13 +682,16 @@ class DeriveExchange:
 
         quote_id = getattr(best_quote, "quote_id", "")
         quote_legs = getattr(best_quote, "legs", [])
+        direction = getattr(best_quote, "direction", None)
 
-        log.info("rfq_sell_best_quote", rfq_id=rfq_id, quote_id=quote_id)
+        log.info("rfq_sell_best_quote", rfq_id=rfq_id, quote_id=quote_id,
+                 maker_direction=str(direction))
 
+        taker_direction = Direction.sell if direction == Direction.buy else Direction.buy
         try:
             exec_result = await asyncio.get_running_loop().run_in_executor(
                 None, lambda: self._client.active_subaccount.rfq.execute_quote(
-                    direction=Direction.sell,
+                    direction=taker_direction,
                     legs=quote_legs,
                     quote_id=quote_id,
                     rfq_id=rfq_id,
