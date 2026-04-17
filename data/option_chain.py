@@ -15,7 +15,7 @@ import structlog
 
 import config
 from core.exchange import DeriveExchange
-from utils.time_utils import today_expiry_api_str, today_expiry_date_str
+from utils.time_utils import today_expiry_api_str
 
 log = structlog.get_logger(__name__)
 
@@ -45,7 +45,6 @@ class OptionChain:
         Returns the total number of 0DTE instruments found.
         """
         expiry_api = today_expiry_api_str()
-        expiry_name = today_expiry_date_str()
         self.calls.clear()
         self.puts.clear()
 
@@ -66,7 +65,7 @@ class OptionChain:
                 continue
 
             _, date_str, strike_str, opt_type = parts
-            if date_str != expiry_name:
+            if date_str != expiry_api:
                 continue
 
             try:
@@ -92,6 +91,6 @@ class OptionChain:
         self.puts.sort(key=lambda x: x.strike)
 
         total = len(self.calls) + len(self.puts)
-        log.info("chain_refreshed", expiry=expiry_name,
+        log.info("chain_refreshed", expiry=expiry_api,
                  calls=len(self.calls), puts=len(self.puts))
         return total
