@@ -171,8 +171,15 @@ class DeriveExchange:
 
     async def _place_limit_order(
         self, instrument: str, direction: str, qty: float, price: float,
+        post_only: bool = True,
     ) -> dict:
-        """Place a GTC limit order via derive-client (handles EIP-712 signing)."""
+        """Place a limit order via derive-client (handles EIP-712 signing).
+
+        post_only=True (default): order is rejected by exchange if it would
+        cross the spread — guarantees maker fill or no fill. Returns
+        {'rejected_post_only': True} when rejected so the caller can
+        reprice and retry.
+        """
         from derive_client.data_types import D, Direction, OrderType
 
         dir_enum = Direction.buy if direction == "buy" else Direction.sell
@@ -184,11 +191,13 @@ class DeriveExchange:
                 direction=dir_enum,
                 order_type=OrderType.limit,
             )
+            tif_name = "post_only" if post_only else "gtc"
             try:
                 from derive_client.data_types import TimeInForce
-                create_kwargs["time_in_force"] = TimeInForce.gtc
+                tif_enum = getattr(TimeInForce, tif_name, None)
+                create_kwargs["time_in_force"] = tif_enum if tif_enum is not None else tif_name
             except ImportError:
-                create_kwargs["time_in_force"] = "gtc"
+                create_kwargs["time_in_force"] = tif_name
 
             result = await asyncio.get_running_loop().run_in_executor(
                 None, lambda: self._client.orders.create(**create_kwargs)
@@ -198,7 +207,8 @@ class DeriveExchange:
             avg_price = getattr(result, "average_price", price)
 
             log.debug("order_placed", instrument=instrument, direction=direction,
-                      qty=qty, price=price, order_id=order_id, status=status)
+                      qty=qty, price=price, order_id=order_id, status=status,
+                      post_only=post_only)
             return {"order_id": str(order_id), "order_status": str(status),
                     "average_price": str(avg_price)}
         except Exception as exc:
@@ -207,6 +217,15 @@ class DeriveExchange:
                 if non_retry in err_str:
                     log.error("order_non_retryable", instrument=instrument, error=str(exc))
                     raise
+            if post_only and (
+                "POST_ONLY" in err_str
+                or "WOULD_CROSS" in err_str
+                or "WOULD CROSS" in err_str
+                or "CROSS_SPREAD" in err_str
+                or "CROSSES" in err_str
+            ):
+                log.debug("post_only_rejected", instrument=instrument, price=price)
+                return {"rejected_post_only": True}
             log.warning("order_failed", instrument=instrument, error=str(exc))
             self.error_count += 1
             return {}
@@ -256,11 +275,11 @@ class DeriveExchange:
         self, instrument: str, qty: float, initial_bid: float,
     ) -> dict | None:
         """
-        Escalating maker buy: start at bid, walk up by 1 tick per attempt.
+        Escalating maker-only buy: start at bid, walk up by 1 tick per attempt.
 
-        Never crosses the spread (capped at ask - 1 tick).
-        Partial fills are accumulated and the chase continues for the
-        remaining quantity.
+        Uses post_only (exchange rejects if crosses spread). Never becomes a
+        taker. Partial fills are accumulated; remaining qty continues the
+        chase. Returns None if all attempts exhausted without full fill.
         """
         if config.DRY_RUN:
             return {"order_id": f"dry-{uuid.uuid4().hex[:12]}",
@@ -288,7 +307,13 @@ class DeriveExchange:
             price = _round_price(base_price + tick * attempt, "up")
             price = min(price, _round_price(ceiling, "up"))
 
-            result = await self._place_limit_order(instrument, "buy", remaining_qty, price)
+            result = await self._place_limit_order(
+                instrument, "buy", remaining_qty, price, post_only=True)
+            if result.get("rejected_post_only"):
+                log.debug("chase_buy_post_only_reject", instrument=instrument,
+                          price=price, attempt=attempt + 1)
+                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                continue
             order_id = result.get("order_id", "")
             if not order_id:
                 break
@@ -356,41 +381,17 @@ class DeriveExchange:
                       attempt=attempt + 1, remaining_qty=remaining_qty,
                       price=price)
 
-        # ── Taker fallback: place at the ask to guarantee fill ──
-        if remaining_qty > 0:
-            log.warning("chase_buy_maker_exhausted_trying_taker", instrument=instrument,
-                        remaining_qty=remaining_qty)
-            ticker = await self.get_ticker(instrument)
-            taker_price = _round_price(
-                ticker.ask if ticker.ask > 0 else initial_bid + tick * 20, "up")
+        if total_filled > 0 and remaining_qty > 0:
+            avg_price = weighted_cost / total_filled
+            log.warning("chase_buy_partial_exhausted", instrument=instrument,
+                        total_filled=total_filled, remaining=remaining_qty,
+                        avg_price=avg_price)
+            return {"order_id": "", "order_status": "partial",
+                    "average_price": str(avg_price),
+                    "filled_amount": str(total_filled),
+                    "remaining_amount": str(remaining_qty)}
 
-            result = await self._place_limit_order(instrument, "buy", remaining_qty, taker_price)
-            order_id = result.get("order_id", "")
-            if order_id:
-                if result.get("order_status") == "filled":
-                    fill_price = float(result.get("average_price", taker_price))
-                    weighted_cost += fill_price * remaining_qty
-                    total_filled += remaining_qty
-                    avg_price = weighted_cost / total_filled
-                    log.info("chase_buy_taker_filled", instrument=instrument,
-                             price=fill_price, total_filled=total_filled)
-                    return {"order_id": order_id, "order_status": "filled",
-                            "average_price": str(avg_price)}
-
-                fill = await self._wait_fill(order_id, timeout=10.0)
-                if fill and fill.get("order_status") == "filled":
-                    fill_price = float(fill.get("average_price", taker_price))
-                    weighted_cost += fill_price * remaining_qty
-                    total_filled += remaining_qty
-                    avg_price = weighted_cost / total_filled
-                    log.info("chase_buy_taker_filled", instrument=instrument,
-                             price=fill_price, total_filled=total_filled)
-                    return {"order_id": order_id, "order_status": "filled",
-                            "average_price": str(avg_price)}
-
-                await self.cancel_order(order_id, instrument)
-
-        log.warning("chase_exhausted_including_taker", instrument=instrument,
+        log.warning("chase_buy_exhausted_no_fill", instrument=instrument,
                     total_filled=total_filled, remaining=remaining_qty)
         return None
 
@@ -400,11 +401,11 @@ class DeriveExchange:
         self, instrument: str, qty: float, initial_ask: float,
     ) -> dict | None:
         """
-        Escalating maker sell: start at ask, walk down by 1 tick per attempt.
+        Escalating maker-only sell: start at ask, walk down by 1 tick per attempt.
 
-        Never crosses the spread (capped at bid + 1 tick).
-        Partial fills are accumulated and the chase continues for the
-        remaining quantity.
+        Uses post_only (exchange rejects if crosses spread). Never becomes a
+        taker. Partial fills are accumulated; remaining qty continues the
+        chase. Returns None if all attempts exhausted without full fill.
         """
         if config.DRY_RUN:
             return {"order_id": f"dry-{uuid.uuid4().hex[:12]}",
@@ -434,7 +435,13 @@ class DeriveExchange:
             if price <= 0:
                 price = tick
 
-            result = await self._place_limit_order(instrument, "sell", remaining_qty, price)
+            result = await self._place_limit_order(
+                instrument, "sell", remaining_qty, price, post_only=True)
+            if result.get("rejected_post_only"):
+                log.debug("chase_sell_post_only_reject", instrument=instrument,
+                          price=price, attempt=attempt + 1)
+                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                continue
             order_id = result.get("order_id", "")
             if not order_id:
                 break
@@ -502,43 +509,17 @@ class DeriveExchange:
                       attempt=attempt + 1, remaining_qty=remaining_qty,
                       price=price)
 
-        # ── Taker fallback: place at the bid to guarantee fill ──
-        if remaining_qty > 0:
-            log.warning("chase_sell_maker_exhausted_trying_taker", instrument=instrument,
-                        remaining_qty=remaining_qty)
-            ticker = await self.get_ticker(instrument)
-            taker_price = _round_price(
-                ticker.bid if ticker.bid > 0 else initial_ask - tick * 20, "down")
-            if taker_price <= 0:
-                taker_price = tick
+        if total_filled > 0 and remaining_qty > 0:
+            avg_price = weighted_revenue / total_filled
+            log.warning("chase_sell_partial_exhausted", instrument=instrument,
+                        total_filled=total_filled, remaining=remaining_qty,
+                        avg_price=avg_price)
+            return {"order_id": "", "order_status": "partial",
+                    "average_price": str(avg_price),
+                    "filled_amount": str(total_filled),
+                    "remaining_amount": str(remaining_qty)}
 
-            result = await self._place_limit_order(instrument, "sell", remaining_qty, taker_price)
-            order_id = result.get("order_id", "")
-            if order_id:
-                if result.get("order_status") == "filled":
-                    fill_price = float(result.get("average_price", taker_price))
-                    weighted_revenue += fill_price * remaining_qty
-                    total_filled += remaining_qty
-                    avg_price = weighted_revenue / total_filled
-                    log.info("chase_sell_taker_filled", instrument=instrument,
-                             price=fill_price, total_filled=total_filled)
-                    return {"order_id": order_id, "order_status": "filled",
-                            "average_price": str(avg_price)}
-
-                fill = await self._wait_fill(order_id, timeout=10.0)
-                if fill and fill.get("order_status") == "filled":
-                    fill_price = float(fill.get("average_price", taker_price))
-                    weighted_revenue += fill_price * remaining_qty
-                    total_filled += remaining_qty
-                    avg_price = weighted_revenue / total_filled
-                    log.info("chase_sell_taker_filled", instrument=instrument,
-                             price=fill_price, total_filled=total_filled)
-                    return {"order_id": order_id, "order_status": "filled",
-                            "average_price": str(avg_price)}
-
-                await self.cancel_order(order_id, instrument)
-
-        log.warning("chase_sell_exhausted_including_taker", instrument=instrument,
+        log.warning("chase_sell_exhausted_no_fill", instrument=instrument,
                     total_filled=total_filled, remaining=remaining_qty)
         return None
 
