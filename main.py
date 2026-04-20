@@ -1,7 +1,7 @@
 """
 Derive 0DTE BTC Pure Straddle Algo.
 
-Single daily session: 14:00–18:00 UTC, Mon–Fri.
+Single daily session: 10:00–14:00 UTC, Mon–Fri.
 Position: 1 ITM call + 1 put (same strike) per QTY_PER_LEG BTC.
 Compound sizing: 80% of current equity, no cap on straddles.
 Maker-only orders with escalating chase on Derive (formerly Lyra).
@@ -241,7 +241,7 @@ class Algo:
             log.error("close_error", exc_info=True)
             await notifier.notify_error("Close", "Unhandled exception — check logs")
 
-    # ──────────────────── Daily Report (19:00 UTC) ────────────────
+    # ──────────────────── Daily Report (15:00 UTC) ────────────────
 
     async def _on_report(self) -> None:
         try:
@@ -250,7 +250,7 @@ class Algo:
             log.error("report_error", exc_info=True)
             await notifier.notify_error("Report", "Daily report failed — check logs")
 
-    # ──────────────────── Weekly Report (Fri 20:00 UTC) ──────────
+    # ──────────────────── Weekly Report (Fri 16:00 UTC) ──────────
 
     async def _on_weekly_report(self) -> None:
         try:
