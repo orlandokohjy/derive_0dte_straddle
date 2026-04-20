@@ -44,6 +44,10 @@ class Algo:
         self.exit_mgr = ExitManager(self.exchange, self.market, self.portfolio)
         self.scheduler = Scheduler()
         self._shutdown = asyncio.Event()
+        # Set by startup reconciliation when exchange state disagrees with
+        # local state. Blocks new entries until manually cleared.
+        self._entry_locked: bool = False
+        self._lock_reason: str = ""
 
     async def start(self) -> None:
         setup_logging()
@@ -56,6 +60,10 @@ class Algo:
 
         self.exchange.connect()
 
+        if not config.DRY_RUN:
+            await self._startup_cancel_stale_orders()
+            await self._startup_reconcile_positions()
+
         spot = await self.exchange.get_spot_price()
 
         if not config.DRY_RUN:
@@ -65,15 +73,19 @@ class Algo:
 
         log.info("algo_initialized",
                  spot=f"${spot:,.2f}",
-                 equity=f"${self.portfolio.equity:,.2f}")
+                 equity=f"${self.portfolio.equity:,.2f}",
+                 entry_locked=self._entry_locked)
 
+        lock_line = (f"\n<b>⚠️ ENTRY LOCKED</b>: {self._lock_reason}"
+                     if self._entry_locked else "")
         await notifier.send(
             f"<b>DERIVE STRADDLE ALGO STARTED</b>\n"
             f"Env: {config.DERIVE_ENV}"
             f"{' (DRY RUN)' if config.DRY_RUN else ''}\n"
             f"Spot: ${spot:,.2f}\n"
             f"Equity: ${self.portfolio.equity:,.2f}\n"
-            f"Time: {format_utc_sgt(now_utc())}\n"
+            f"Time: {format_utc_sgt(now_utc())}"
+            f"{lock_line}\n"
         )
 
         self.scheduler.register_session(
@@ -96,6 +108,91 @@ class Algo:
         log.info("algo_running")
         await self._shutdown.wait()
 
+    # ──────────────────── Startup Safeguards ──────────────────────
+
+    async def _startup_cancel_stale_orders(self) -> None:
+        """Cancel any resting orders from a previous run before the scheduler
+        starts. Stale orders eat margin and can cause 'Insufficient funds'
+        errors on new RFQs/entries (seen 2026-04-20).
+        """
+        try:
+            cancelled = await self.exchange.cancel_all_open_orders()
+            if cancelled > 0:
+                await notifier.send(
+                    f"<b>STARTUP CLEANUP</b>\n"
+                    f"Cancelled {cancelled} stale open order(s) from previous run."
+                )
+        except Exception:
+            log.error("startup_cancel_failed", exc_info=True)
+            await notifier.notify_error(
+                "Startup cleanup",
+                "Failed to cancel stale orders — check logs manually")
+
+    async def _startup_reconcile_positions(self) -> None:
+        """Compare exchange positions against local positions.json.
+
+        If they disagree, set entry lock to prevent blind re-entry on top
+        of a mis-tracked position (which would compound errors).
+        """
+        try:
+            exchange_positions = await self.exchange.list_open_positions()
+        except Exception:
+            log.error("reconcile_fetch_failed", exc_info=True)
+            self._entry_locked = True
+            self._lock_reason = "Could not fetch positions from Derive"
+            await notifier.notify_error(
+                "Startup reconciliation",
+                "Failed to fetch exchange positions — entries blocked")
+            return
+
+        exchange_has_positions = len(exchange_positions) > 0
+        local_has_straddle = self.portfolio.has_open
+
+        log.info("startup_reconcile",
+                 exchange_positions=len(exchange_positions),
+                 exchange_detail=[f"{p['instrument_name']} {p['amount']:+.4f}"
+                                  for p in exchange_positions],
+                 local_has_straddle=local_has_straddle)
+
+        if exchange_has_positions and not local_has_straddle:
+            details = "\n".join(
+                f"  • {p['instrument_name']}  amt={p['amount']:+.4f}  "
+                f"avg=${p['average_price']:,.2f}  mark=${p['mark_price']:,.2f}  "
+                f"uPnL=${p['unrealized_pnl']:+,.2f}"
+                for p in exchange_positions
+            )
+            self._entry_locked = True
+            self._lock_reason = (
+                f"Exchange has {len(exchange_positions)} open position(s) "
+                f"but algo state is empty — possible orphan"
+            )
+            await notifier.send(
+                f"<b>⚠️ RECONCILIATION MISMATCH</b>\n"
+                f"Exchange has open positions but algo state is empty.\n\n"
+                f"<b>Exchange positions:</b>\n{details}\n\n"
+                f"<b>ACTION</b>: Entry locked until manually resolved.\n"
+                f"Either close the positions or update positions.json.\n"
+            )
+            return
+
+        if local_has_straddle and not exchange_has_positions:
+            self._entry_locked = True
+            self._lock_reason = (
+                "Algo state has open straddle but exchange shows flat — "
+                "stale positions.json"
+            )
+            await notifier.send(
+                f"<b>⚠️ RECONCILIATION MISMATCH</b>\n"
+                f"Algo state claims open straddle but exchange shows flat.\n\n"
+                f"<b>ACTION</b>: Entry locked. Clear state/positions.json "
+                f"to reset."
+            )
+            return
+
+        log.info("startup_reconcile_ok",
+                 flat=(not exchange_has_positions and not local_has_straddle),
+                 matched_open=(exchange_has_positions and local_has_straddle))
+
     # ──────────────────── Entry ───────────────────────────────────
 
     async def _on_entry(self) -> None:
@@ -107,6 +204,11 @@ class Algo:
 
     async def _run_entry(self) -> None:
         log.info("session_entry_start")
+
+        if self._entry_locked:
+            log.warning("entry_blocked_lock", reason=self._lock_reason)
+            await notifier.notify_skip(f"Entry locked: {self._lock_reason}")
+            return
 
         api_check = self.risk.check_api_health(self.exchange.error_count)
         if not api_check.allowed:

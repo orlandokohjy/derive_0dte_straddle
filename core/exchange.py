@@ -26,7 +26,20 @@ import config
 
 log = structlog.get_logger(__name__)
 
-NON_RETRYABLE_ERRORS = {"INSUFFICIENT_MARGIN", "INSUFFICIENT_BALANCE"}
+INSUFFICIENT_FUNDS_TOKENS = (
+    "INSUFFICIENT FUNDS",
+    "INSUFFICIENT_FUNDS",
+    "INSUFFICIENT_MARGIN",
+    "INSUFFICIENT MARGIN",
+    "INSUFFICIENT_BALANCE",
+    "INSUFFICIENT BALANCE",
+    "11000",
+)
+
+
+def _is_insufficient_funds(err_str: str) -> bool:
+    upper = err_str.upper()
+    return any(token in upper for token in INSUFFICIENT_FUNDS_TOKENS)
 
 
 def _round_price(price: float, direction: str = "down") -> float:
@@ -212,21 +225,23 @@ class DeriveExchange:
             return {"order_id": str(order_id), "order_status": str(status),
                     "average_price": str(avg_price)}
         except Exception as exc:
-            err_str = str(exc).upper()
-            for non_retry in NON_RETRYABLE_ERRORS:
-                if non_retry in err_str:
-                    log.error("order_non_retryable", instrument=instrument, error=str(exc))
-                    raise
+            err_str = str(exc)
+            err_upper = err_str.upper()
+            if _is_insufficient_funds(err_str):
+                log.error("order_insufficient_funds", instrument=instrument,
+                          direction=direction, qty=qty, price=price,
+                          error=err_str)
+                return {"rejected_insufficient_funds": True, "error": err_str}
             if post_only and (
-                "POST_ONLY" in err_str
-                or "WOULD_CROSS" in err_str
-                or "WOULD CROSS" in err_str
-                or "CROSS_SPREAD" in err_str
-                or "CROSSES" in err_str
+                "POST_ONLY" in err_upper
+                or "WOULD_CROSS" in err_upper
+                or "WOULD CROSS" in err_upper
+                or "CROSS_SPREAD" in err_upper
+                or "CROSSES" in err_upper
             ):
                 log.debug("post_only_rejected", instrument=instrument, price=price)
                 return {"rejected_post_only": True}
-            log.warning("order_failed", instrument=instrument, error=str(exc))
+            log.warning("order_failed", instrument=instrument, error=err_str)
             self.error_count += 1
             return {}
 
@@ -269,49 +284,169 @@ class DeriveExchange:
         except Exception:
             log.debug("cancel_failed", order_id=order_id, exc_info=True)
 
+    async def list_open_orders(self) -> list[dict]:
+        """List all open orders on the active subaccount."""
+        try:
+            sub = self._client.active_subaccount
+            orders = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: list(sub.orders.list_open())
+            )
+            out = []
+            for o in orders:
+                out.append({
+                    "order_id": str(getattr(o, "order_id", "")),
+                    "instrument_name": str(getattr(o, "instrument_name", "")),
+                    "direction": str(getattr(o, "direction", "")),
+                    "amount": str(getattr(o, "amount", "")),
+                    "limit_price": str(getattr(o, "limit_price", "")),
+                    "order_status": str(getattr(o, "order_status", "")),
+                })
+            return out
+        except Exception:
+            log.warning("list_open_orders_failed", exc_info=True)
+            return []
+
+    async def cancel_all_open_orders(self) -> int:
+        """Cancel every resting order on the active subaccount.
+
+        Returns the number of orders cancelled. Called at startup to clear
+        stale orders left from a previous run (which eat margin).
+        """
+        orders = await self.list_open_orders()
+        if not orders:
+            log.info("cancel_all_no_open_orders")
+            return 0
+
+        log.warning("cancel_all_found_stale_orders", count=len(orders),
+                    orders=[f"{o['instrument_name']} {o['direction']} "
+                            f"{o['amount']}@{o['limit_price']}"
+                            for o in orders])
+
+        cancelled = 0
+        for o in orders:
+            oid = o.get("order_id", "")
+            inst = o.get("instrument_name", "")
+            if not oid or not inst:
+                continue
+            try:
+                await self.cancel_order(oid, inst)
+                cancelled += 1
+            except Exception:
+                log.warning("cancel_one_failed", order_id=oid,
+                            instrument=inst, exc_info=True)
+        log.info("cancel_all_done", cancelled=cancelled, attempted=len(orders))
+        return cancelled
+
+    async def list_open_positions(self) -> list[dict]:
+        """List non-zero positions on the active subaccount."""
+        try:
+            sub = self._client.active_subaccount
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: sub.refresh()
+            )
+            positions = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: list(sub.positions.list())
+            )
+            out = []
+            for p in positions:
+                amt = float(getattr(p, "amount", 0) or 0)
+                if amt == 0:
+                    continue
+                out.append({
+                    "instrument_name": str(getattr(p, "instrument_name", "")),
+                    "amount": amt,
+                    "average_price": float(getattr(p, "average_price", 0) or 0),
+                    "mark_price": float(getattr(p, "mark_price", 0) or 0),
+                    "unrealized_pnl": float(getattr(p, "unrealized_pnl", 0) or 0),
+                })
+            return out
+        except Exception:
+            log.warning("list_positions_failed", exc_info=True)
+            return []
+
     # ──────────────────── Chase Buy (Escalating Maker) ────────────
 
     async def chase_buy(
         self, instrument: str, qty: float, initial_bid: float,
     ) -> dict | None:
         """
-        Escalating maker-only buy: start at bid, walk up by 1 tick per attempt.
+        Maker-only buy with 50%-gap narrowing + fair-value cap + deadline.
 
-        Uses post_only (exchange rejects if crosses spread). Never becomes a
-        taker. Partial fills are accumulated; remaining qty continues the
-        chase. Returns None if all attempts exhausted without full fill.
+        On each attempt:
+          - new_price = current_price + (ask - current_price) * GAP_NARROW_PCT
+          - price is hard-capped at min(ask - tick, mark * MAX_SLIPPAGE_FACTOR)
+          - if cap reached and still no fill, waits (does not cross)
+
+        Aborts on "Insufficient funds" errors (propagates rejected_insufficient_funds).
+        Uses post_only (exchange rejects if crosses spread). Never a taker.
         """
         if config.DRY_RUN:
             return {"order_id": f"dry-{uuid.uuid4().hex[:12]}",
                     "order_status": "filled", "average_price": str(initial_bid)}
 
-        log.info("chase_buy_maker", instrument=instrument, qty=qty)
+        log.info("chase_buy_maker_start", instrument=instrument, qty=qty,
+                 initial_bid=initial_bid,
+                 gap_pct=config.OPTION_CHASE_GAP_NARROW_PCT,
+                 slip_factor=config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR,
+                 deadline_min=config.OPTION_CHASE_DEADLINE_MIN)
         tick = config.OPTION_TICK_SIZE
         remaining_qty = qty
         weighted_cost = 0.0
         total_filled = 0.0
 
-        for attempt in range(config.OPTION_CHASE_MAX_ATTEMPTS):
-            if remaining_qty <= 0:
-                break
+        deadline = _time.time() + config.OPTION_CHASE_DEADLINE_MIN * 60.0
+        current_price = _round_price(
+            initial_bid if initial_bid > 0 else tick, "down")
+        attempt = 0
 
+        while _time.time() < deadline and remaining_qty > 0:
+            attempt += 1
             ticker = await self.get_ticker(instrument)
 
-            if ticker.bid > 0:
-                base_price = ticker.bid
-                ceiling = ticker.ask - tick if ticker.ask > 0 else ticker.bid + tick * 10
-            else:
-                base_price = initial_bid
-                ceiling = initial_bid + tick * 10
+            ask = ticker.ask if ticker.ask > 0 else initial_bid + tick * 10
+            bid = ticker.bid if ticker.bid > 0 else initial_bid
+            mark = ticker.mark if ticker.mark > 0 else (bid + ask) / 2.0
 
-            price = _round_price(base_price + tick * attempt, "up")
-            price = min(price, _round_price(ceiling, "up"))
+            slip_cap = mark * config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR
+            spread_cap = ask - tick
+            hard_cap = min(slip_cap, spread_cap)
+
+            if attempt == 1:
+                candidate = max(bid, current_price)
+            else:
+                gap = max(0.0, ask - current_price)
+                candidate = current_price + gap * config.OPTION_CHASE_GAP_NARROW_PCT
+                candidate = max(candidate, current_price + tick)
+
+            price = _round_price(min(candidate, hard_cap), "up")
+            if price < tick:
+                price = tick
+
+            if price > slip_cap:
+                log.warning("chase_buy_cap_reached", instrument=instrument,
+                            price=price, slip_cap=slip_cap, mark=mark,
+                            attempt=attempt,
+                            remaining_qty=remaining_qty)
+                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                continue
+
+            current_price = price
 
             result = await self._place_limit_order(
                 instrument, "buy", remaining_qty, price, post_only=True)
+            if result.get("rejected_insufficient_funds"):
+                log.error("chase_buy_insufficient_funds_abort",
+                          instrument=instrument, price=price,
+                          total_filled=total_filled, remaining=remaining_qty)
+                return {"rejected_insufficient_funds": True,
+                        "error": result.get("error", "insufficient funds"),
+                        "filled_amount": str(total_filled),
+                        "remaining_amount": str(remaining_qty),
+                        "average_price": str(weighted_cost / total_filled)
+                                         if total_filled > 0 else "0"}
             if result.get("rejected_post_only"):
                 log.debug("chase_buy_post_only_reject", instrument=instrument,
-                          price=price, attempt=attempt + 1)
+                          price=price, attempt=attempt)
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
             order_id = result.get("order_id", "")
@@ -325,7 +460,7 @@ class DeriveExchange:
                 avg_price = weighted_cost / total_filled
                 log.info("chase_filled_immediate", instrument=instrument,
                          price=fill_price, total_filled=total_filled,
-                         attempt=attempt + 1)
+                         attempt=attempt)
                 return {"order_id": order_id, "order_status": "filled",
                         "average_price": str(avg_price)}
 
@@ -339,7 +474,7 @@ class DeriveExchange:
                 avg_price = weighted_cost / total_filled
                 log.info("chase_filled", instrument=instrument,
                          price=fill_price, total_filled=total_filled,
-                         attempt=attempt + 1)
+                         attempt=attempt)
                 return {"order_id": order_id, "order_status": "filled",
                         "average_price": str(avg_price)}
 
@@ -353,7 +488,7 @@ class DeriveExchange:
                 avg_price = weighted_cost / total_filled
                 log.info("chase_filled_post_cancel", instrument=instrument,
                          price=fill_price, total_filled=total_filled,
-                         attempt=attempt + 1)
+                         attempt=attempt)
                 return {"order_id": order_id, "order_status": "filled",
                         "average_price": str(avg_price)}
 
@@ -369,30 +504,31 @@ class DeriveExchange:
                     avg_price = weighted_cost / total_filled
                     log.info("chase_filled_post_cancel", instrument=instrument,
                              price=fill_price, total_filled=total_filled,
-                             attempt=attempt + 1)
+                             attempt=attempt)
                     return {"order_id": order_id, "order_status": "filled",
                             "average_price": str(avg_price)}
 
                 log.info("chase_partial_fill", instrument=instrument,
                          filled=filled_amt, remaining=remaining_qty,
-                         attempt=attempt + 1)
+                         attempt=attempt)
 
             log.debug("chase_reprice", instrument=instrument,
-                      attempt=attempt + 1, remaining_qty=remaining_qty,
+                      attempt=attempt, remaining_qty=remaining_qty,
                       price=price)
 
         if total_filled > 0 and remaining_qty > 0:
             avg_price = weighted_cost / total_filled
-            log.warning("chase_buy_partial_exhausted", instrument=instrument,
+            log.warning("chase_buy_partial_deadline", instrument=instrument,
                         total_filled=total_filled, remaining=remaining_qty,
-                        avg_price=avg_price)
+                        avg_price=avg_price, attempts=attempt)
             return {"order_id": "", "order_status": "partial",
                     "average_price": str(avg_price),
                     "filled_amount": str(total_filled),
                     "remaining_amount": str(remaining_qty)}
 
-        log.warning("chase_buy_exhausted_no_fill", instrument=instrument,
-                    total_filled=total_filled, remaining=remaining_qty)
+        log.warning("chase_buy_deadline_no_fill", instrument=instrument,
+                    total_filled=total_filled, remaining=remaining_qty,
+                    attempts=attempt)
         return None
 
     # ──────────────────── Chase Sell (Escalating Maker) ───────────
@@ -401,45 +537,80 @@ class DeriveExchange:
         self, instrument: str, qty: float, initial_ask: float,
     ) -> dict | None:
         """
-        Escalating maker-only sell: start at ask, walk down by 1 tick per attempt.
+        Maker-only sell with 50%-gap narrowing + fair-value floor + deadline.
 
-        Uses post_only (exchange rejects if crosses spread). Never becomes a
-        taker. Partial fills are accumulated; remaining qty continues the
-        chase. Returns None if all attempts exhausted without full fill.
+        On each attempt:
+          - new_price = current_price - (current_price - bid) * GAP_NARROW_PCT
+          - price is hard-floored at max(bid + tick, mark / MAX_SLIPPAGE_FACTOR)
+
+        Aborts on "Insufficient funds" errors. Uses post_only. Never a taker.
         """
         if config.DRY_RUN:
             return {"order_id": f"dry-{uuid.uuid4().hex[:12]}",
                     "order_status": "filled", "average_price": str(initial_ask)}
 
-        log.info("chase_sell_maker", instrument=instrument, qty=qty)
+        log.info("chase_sell_maker_start", instrument=instrument, qty=qty,
+                 initial_ask=initial_ask,
+                 gap_pct=config.OPTION_CHASE_GAP_NARROW_PCT,
+                 slip_factor=config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR,
+                 deadline_min=config.OPTION_CHASE_DEADLINE_MIN)
         tick = config.OPTION_TICK_SIZE
         remaining_qty = qty
         weighted_revenue = 0.0
         total_filled = 0.0
 
-        for attempt in range(config.OPTION_CHASE_MAX_ATTEMPTS):
-            if remaining_qty <= 0:
-                break
+        deadline = _time.time() + config.OPTION_CHASE_DEADLINE_MIN * 60.0
+        current_price = _round_price(
+            initial_ask if initial_ask > 0 else tick, "up")
+        attempt = 0
 
+        while _time.time() < deadline and remaining_qty > 0:
+            attempt += 1
             ticker = await self.get_ticker(instrument)
 
-            if ticker.ask > 0:
-                base_price = ticker.ask
-                floor_price = ticker.bid + tick if ticker.bid > 0 else ticker.ask - tick * 10
-            else:
-                base_price = initial_ask
-                floor_price = initial_ask - tick * 10
+            ask = ticker.ask if ticker.ask > 0 else initial_ask
+            bid = ticker.bid if ticker.bid > 0 else initial_ask - tick * 10
+            mark = ticker.mark if ticker.mark > 0 else (bid + ask) / 2.0
 
-            price = _round_price(base_price - tick * attempt, "down")
-            price = max(price, _round_price(floor_price, "down"))
-            if price <= 0:
+            slip_floor = mark / config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR
+            spread_floor = bid + tick
+            hard_floor = max(slip_floor, spread_floor)
+
+            if attempt == 1:
+                candidate = min(ask, current_price) if current_price > 0 else ask
+            else:
+                gap = max(0.0, current_price - bid)
+                candidate = current_price - gap * config.OPTION_CHASE_GAP_NARROW_PCT
+                candidate = min(candidate, current_price - tick)
+
+            price = _round_price(max(candidate, hard_floor), "down")
+            if price < tick:
                 price = tick
+
+            if price < slip_floor:
+                log.warning("chase_sell_floor_reached", instrument=instrument,
+                            price=price, slip_floor=slip_floor, mark=mark,
+                            attempt=attempt, remaining_qty=remaining_qty)
+                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                continue
+
+            current_price = price
 
             result = await self._place_limit_order(
                 instrument, "sell", remaining_qty, price, post_only=True)
+            if result.get("rejected_insufficient_funds"):
+                log.error("chase_sell_insufficient_funds_abort",
+                          instrument=instrument, price=price,
+                          total_filled=total_filled, remaining=remaining_qty)
+                return {"rejected_insufficient_funds": True,
+                        "error": result.get("error", "insufficient funds"),
+                        "filled_amount": str(total_filled),
+                        "remaining_amount": str(remaining_qty),
+                        "average_price": str(weighted_revenue / total_filled)
+                                         if total_filled > 0 else "0"}
             if result.get("rejected_post_only"):
                 log.debug("chase_sell_post_only_reject", instrument=instrument,
-                          price=price, attempt=attempt + 1)
+                          price=price, attempt=attempt)
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
             order_id = result.get("order_id", "")
@@ -453,7 +624,7 @@ class DeriveExchange:
                 avg_price = weighted_revenue / total_filled
                 log.info("chase_sell_filled_immediate", instrument=instrument,
                          price=fill_price, total_filled=total_filled,
-                         attempt=attempt + 1)
+                         attempt=attempt)
                 return {"order_id": order_id, "order_status": "filled",
                         "average_price": str(avg_price)}
 
@@ -467,7 +638,7 @@ class DeriveExchange:
                 avg_price = weighted_revenue / total_filled
                 log.info("chase_sell_filled", instrument=instrument,
                          price=fill_price, total_filled=total_filled,
-                         attempt=attempt + 1)
+                         attempt=attempt)
                 return {"order_id": order_id, "order_status": "filled",
                         "average_price": str(avg_price)}
 
@@ -481,7 +652,7 @@ class DeriveExchange:
                 avg_price = weighted_revenue / total_filled
                 log.info("chase_sell_filled_post_cancel", instrument=instrument,
                          price=fill_price, total_filled=total_filled,
-                         attempt=attempt + 1)
+                         attempt=attempt)
                 return {"order_id": order_id, "order_status": "filled",
                         "average_price": str(avg_price)}
 
@@ -497,30 +668,31 @@ class DeriveExchange:
                     avg_price = weighted_revenue / total_filled
                     log.info("chase_sell_filled_post_cancel", instrument=instrument,
                              price=fill_price, total_filled=total_filled,
-                             attempt=attempt + 1)
+                             attempt=attempt)
                     return {"order_id": order_id, "order_status": "filled",
                             "average_price": str(avg_price)}
 
                 log.info("chase_sell_partial_fill", instrument=instrument,
                          filled=filled_amt, remaining=remaining_qty,
-                         attempt=attempt + 1)
+                         attempt=attempt)
 
             log.debug("chase_sell_reprice", instrument=instrument,
-                      attempt=attempt + 1, remaining_qty=remaining_qty,
+                      attempt=attempt, remaining_qty=remaining_qty,
                       price=price)
 
         if total_filled > 0 and remaining_qty > 0:
             avg_price = weighted_revenue / total_filled
-            log.warning("chase_sell_partial_exhausted", instrument=instrument,
+            log.warning("chase_sell_partial_deadline", instrument=instrument,
                         total_filled=total_filled, remaining=remaining_qty,
-                        avg_price=avg_price)
+                        avg_price=avg_price, attempts=attempt)
             return {"order_id": "", "order_status": "partial",
                     "average_price": str(avg_price),
                     "filled_amount": str(total_filled),
                     "remaining_amount": str(remaining_qty)}
 
-        log.warning("chase_sell_exhausted_no_fill", instrument=instrument,
-                    total_filled=total_filled, remaining=remaining_qty)
+        log.warning("chase_sell_deadline_no_fill", instrument=instrument,
+                    total_filled=total_filled, remaining=remaining_qty,
+                    attempts=attempt)
         return None
 
     # ──────────────────── RFQ (Atomic Multi-Leg) ───────────────────

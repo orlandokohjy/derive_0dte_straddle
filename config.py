@@ -34,7 +34,7 @@ QTY_PER_LEG: float = float(os.getenv("QTY_PER_LEG", "1.0"))
 
 INITIAL_CAPITAL_USD: float = float(os.getenv("INITIAL_CAPITAL_USD", "8000.0"))
 ALLOC_PCT: float = 0.80
-NUM_STRADDLES_OVERRIDE: int = int(os.getenv("NUM_STRADDLES_OVERRIDE", "0"))  # >0 forces exact count
+NUM_STRADDLES_OVERRIDE: int = int(os.getenv("NUM_STRADDLES_OVERRIDE", "1"))  # >0 forces exact count; default 1 to prevent auto-sizing multiple straddles
 
 # ──────────────────── Session Schedule (UTC) ──────────────────────
 SESSION_ENTRY_UTC: time = time(12, 0)
@@ -47,6 +47,13 @@ ALLOWED_WEEKDAYS: set[int] = {0, 1, 2, 3, 4}  # Mon–Fri
 OPTION_CHASE_INTERVAL_SEC: float = 5.0
 OPTION_CHASE_MAX_ATTEMPTS: int = 60
 OPTION_TICK_SIZE: float = 5.0
+
+# Chase logic: on each retry narrow the gap to the ask/bid by this pct
+OPTION_CHASE_GAP_NARROW_PCT: float = float(os.getenv("OPTION_CHASE_GAP_NARROW_PCT", "0.5"))
+# Hard cap on our buy price: mark * MAX_SLIPPAGE_FACTOR. Also floor on sell.
+OPTION_CHASE_MAX_SLIPPAGE_FACTOR: float = float(os.getenv("OPTION_CHASE_MAX_SLIPPAGE_FACTOR", "1.15"))
+# Abort chase after this many minutes of no full fill
+OPTION_CHASE_DEADLINE_MIN: float = float(os.getenv("OPTION_CHASE_DEADLINE_MIN", "10.0"))
 
 # ──────────────────── Risk Management ─────────────────────────────
 MAX_DAILY_LOSS_PCT: float | None = None
