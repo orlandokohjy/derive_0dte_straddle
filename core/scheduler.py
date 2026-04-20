@@ -1,4 +1,4 @@
-"""APScheduler wrapper — single session: entry at 10:00, close at 14:00 UTC."""
+"""APScheduler wrapper — single session: entry at 12:00, close at 14:00 UTC."""
 from __future__ import annotations
 
 from datetime import datetime

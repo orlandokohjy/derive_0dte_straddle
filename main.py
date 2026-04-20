@@ -1,7 +1,7 @@
 """
 Derive 0DTE BTC Pure Straddle Algo.
 
-Single daily session: 10:00–14:00 UTC, Mon–Fri.
+Single daily session: 12:00–14:00 UTC, Mon–Fri.
 Position: 1 ITM call + 1 put (same strike) per QTY_PER_LEG BTC.
 Compound sizing: 80% of current equity, no cap on straddles.
 Maker-only orders with escalating chase on Derive (formerly Lyra).
