@@ -11,3 +11,4 @@ services:
     volumes:
       - ./state:/app/state
       - ./logs:/app/logs
+      - ./.env:/app/.env
