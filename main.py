@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import signal
 import sys
 
@@ -34,6 +35,35 @@ from utils import volume_tracker
 log = structlog.get_logger(__name__)
 
 
+def _disable_entry_now_in_env_file(env_path: str = ".env") -> None:
+    """Rewrite ENTRY_NOW=true to ENTRY_NOW=false in the local .env file.
+
+    Called immediately after consuming an immediate-entry trigger so that the
+    next container restart does NOT fire entry again. Silent no-op if the
+    file is missing, read-only, or doesn't contain ENTRY_NOW.
+    """
+    try:
+        if not os.path.exists(env_path):
+            log.debug("entry_now_disable_skipped", reason="no_env_file")
+            return
+        with open(env_path, "r") as f:
+            content = f.read()
+        new_content = re.sub(
+            r"^(\s*ENTRY_NOW\s*=\s*)(true|TRUE|True|1)\b.*$",
+            r"\1false",
+            content,
+            flags=re.MULTILINE,
+        )
+        if new_content != content:
+            with open(env_path, "w") as f:
+                f.write(new_content)
+            log.info("entry_now_auto_disabled", env_path=env_path)
+        else:
+            log.debug("entry_now_disable_noop", reason="no_match")
+    except Exception:
+        log.warning("entry_now_disable_failed", exc_info=True)
+
+
 class Algo:
     def __init__(self) -> None:
         self.exchange = DeriveExchange()
@@ -45,9 +75,10 @@ class Algo:
         self.scheduler = Scheduler()
         self._shutdown = asyncio.Event()
         # Set by startup reconciliation when exchange state disagrees with
-        # local state. Blocks new entries until manually cleared.
+        # local state, or by the consecutive-failure circuit breaker.
         self._entry_locked: bool = False
         self._lock_reason: str = ""
+        self._consecutive_failures: int = 0
 
     async def start(self) -> None:
         setup_logging()
@@ -103,6 +134,7 @@ class Algo:
 
         if os.getenv("ENTRY_NOW", "").lower() == "true":
             log.info("immediate_entry_triggered")
+            _disable_entry_now_in_env_file()
             await self._on_entry()
 
         log.info("algo_running")
@@ -270,6 +302,25 @@ class Algo:
             await notifier.notify_skip(entry_check.reason)
             return
 
+        # ── Pre-entry collateral check ──
+        if not config.DRY_RUN:
+            available = await self.exchange.get_subaccount_equity()
+            required = sizing.total_capital_required \
+                * config.COLLATERAL_BUFFER_FACTOR
+            if available > 0 and available < required:
+                msg = (
+                    f"Insufficient collateral on Derive subaccount.\n"
+                    f"Available: ${available:,.2f}\n"
+                    f"Required (× {config.COLLATERAL_BUFFER_FACTOR:.2f} "
+                    f"buffer): ${required:,.2f}"
+                )
+                log.warning("collateral_check_failed", msg=msg)
+                await notifier.notify_skip(msg)
+                return
+            log.info("collateral_check_ok",
+                     available=f"${available:,.2f}",
+                     required=f"${required:,.2f}")
+
         log.info(
             "preflight_check_passed",
             num_straddles=sizing.num_straddles,
@@ -302,6 +353,7 @@ class Algo:
             self.exchange, self.market, self.portfolio, pair, sizing.num_straddles,
         )
         if straddle:
+            self._consecutive_failures = 0
             volume_tracker.record_trade(sizing.num_straddles)
             await notifier.notify_entry(
                 num_straddles=sizing.num_straddles,
@@ -316,6 +368,56 @@ class Algo:
             log.info("session_entry_done", num_straddles=sizing.num_straddles)
         else:
             log.error("straddle_build_failed")
+            self._register_session_failure("build_straddle returned None")
+
+    # ──────────────────── Failure tracking / circuit breaker ─────
+
+    def _register_session_failure(self, reason: str) -> None:
+        """Increment failure counter; lock entries if threshold exceeded."""
+        self._consecutive_failures += 1
+        log.warning("session_failure_recorded",
+                    count=self._consecutive_failures,
+                    limit=config.CONSECUTIVE_FAILURE_LIMIT, reason=reason)
+        if self._consecutive_failures >= config.CONSECUTIVE_FAILURE_LIMIT:
+            self._entry_locked = True
+            self._lock_reason = (
+                f"{self._consecutive_failures} consecutive session failures "
+                f"— restart algo to reset"
+            )
+            asyncio.create_task(notifier.send(
+                f"<b>⚠️ CIRCUIT BREAKER TRIPPED</b>\n"
+                f"{self._consecutive_failures} consecutive session failures.\n"
+                f"Entry LOCKED until restart."
+            ))
+
+    # ──────────────────── End-of-session reconciliation ──────────
+
+    async def _post_close_reconcile(self) -> None:
+        """After unwind, verify exchange is actually flat. Alert on orphans."""
+        try:
+            positions = await self.exchange.list_open_positions()
+        except Exception:
+            log.warning("post_close_reconcile_fetch_failed", exc_info=True)
+            return
+
+        if not positions:
+            log.info("post_close_flat_ok")
+            return
+
+        details = "\n".join(
+            f"  • {p['instrument_name']}  amt={p['amount']:+.4f}  "
+            f"mark=${p['mark_price']:,.2f}  uPnL=${p['unrealized_pnl']:+,.2f}"
+            for p in positions
+        )
+        log.warning("post_close_orphan_detected", positions=len(positions))
+        await notifier.send(
+            f"<b>⚠️ POST-CLOSE ORPHAN DETECTED</b>\n"
+            f"Unwind ran but exchange still has {len(positions)} "
+            f"position(s):\n\n"
+            f"{details}\n\n"
+            f"<b>ACTION</b>: investigate & close manually. Next entry "
+            f"will be blocked at startup reconciliation."
+        )
 
     # ──────────────────── Close ───────────────────────────────────
 
@@ -328,6 +430,7 @@ class Algo:
                 live_equity = await self.exchange.get_subaccount_equity()
                 if live_equity > 0:
                     self.portfolio.sync_equity(live_equity)
+                await self._post_close_reconcile()
 
             actual_pnl = self.portfolio.equity - equity_before
             if actual_pnl != 0.0:

@@ -55,10 +55,28 @@ OPTION_CHASE_MAX_SLIPPAGE_FACTOR: float = float(os.getenv("OPTION_CHASE_MAX_SLIP
 # Abort chase after this many minutes of no full fill
 OPTION_CHASE_DEADLINE_MIN: float = float(os.getenv("OPTION_CHASE_DEADLINE_MIN", "10.0"))
 
+# Pre-entry spread sanity gate — skip session if either leg's
+# (ask − bid) / mid > this. 0.30 = skip if spread is wider than 30 % of mid.
+OPTION_MAX_ENTRY_SPREAD_PCT: float = float(
+    os.getenv("OPTION_MAX_ENTRY_SPREAD_PCT", "0.30")
+)
+
 # ──────────────────── Risk Management ─────────────────────────────
 MAX_DAILY_LOSS_PCT: float | None = None
 CIRCUIT_BREAKER_API_ERRORS: int = 5
 CIRCUIT_BREAKER_COOLDOWN_SEC: float = 300.0
+
+# Pre-entry collateral safety buffer — entry is skipped unless available
+# subaccount collateral ≥ expected_premium × this factor.
+COLLATERAL_BUFFER_FACTOR: float = float(
+    os.getenv("COLLATERAL_BUFFER_FACTOR", "1.2")
+)
+
+# Lock the algo after this many consecutive session failures.
+# Manual unlock (restart) required.
+CONSECUTIVE_FAILURE_LIMIT: int = int(
+    os.getenv("CONSECUTIVE_FAILURE_LIMIT", "3")
+)
 
 # ──────────────────── Telegram ────────────────────────────────────
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")

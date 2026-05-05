@@ -25,6 +25,13 @@ from utils.time_utils import now_utc
 log = structlog.get_logger(__name__)
 
 
+def _spread_pct(bid: float, ask: float) -> float:
+    if bid <= 0 or ask <= 0:
+        return 1.0
+    mid = (bid + ask) / 2.0
+    return (ask - bid) / mid if mid > 0 else 1.0
+
+
 async def build_straddle(
     exchange: DeriveExchange,
     market: MarketData,
@@ -38,12 +45,36 @@ async def build_straddle(
     Primary: RFQ for both legs atomically.
     Fallback: individual leg chasing if RFQ produces no quotes.
     """
+    from core import notifier
+
     straddle_id = f"D0-{uuid.uuid4().hex[:8]}"
     total_qty = config.QTY_PER_LEG * num_straddles
 
     log.info("building_straddle", id=straddle_id, strike=pair.strike,
              call=pair.call.symbol, put=pair.put.symbol, num=num_straddles,
              method="rfq")
+
+    # ── Pre-entry spread gate ──
+    call_spread = _spread_pct(pair.call.bid, pair.call.ask)
+    put_spread = _spread_pct(pair.put.bid, pair.put.ask)
+    if (call_spread > config.OPTION_MAX_ENTRY_SPREAD_PCT
+            or put_spread > config.OPTION_MAX_ENTRY_SPREAD_PCT):
+        msg = (
+            f"Entry spread too wide — call={call_spread:.1%}, "
+            f"put={put_spread:.1%}, "
+            f"limit={config.OPTION_MAX_ENTRY_SPREAD_PCT:.0%}"
+        )
+        log.warning("spread_gate_skip", id=straddle_id, msg=msg)
+        await notifier.send(
+            f"<b>ENTRY SKIPPED — wide spread</b> [{straddle_id}]\n"
+            f"Strike: ${pair.strike:,.0f}\n"
+            f"  Call:  bid=${pair.call.bid:,.2f}  ask=${pair.call.ask:,.2f}  "
+            f"spread={call_spread:.1%}\n"
+            f"  Put:   bid=${pair.put.bid:,.2f}  ask=${pair.put.ask:,.2f}  "
+            f"spread={put_spread:.1%}\n"
+            f"Cap: {config.OPTION_MAX_ENTRY_SPREAD_PCT:.0%}\n"
+        )
+        return None
 
     # ── Primary: RFQ atomic entry ──
     rfq_result = await exchange.send_rfq(
