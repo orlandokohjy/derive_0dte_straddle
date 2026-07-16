@@ -64,6 +64,26 @@ class DeriveExchange:
     def __init__(self) -> None:
         self._client = None
         self.error_count: int = 0
+        self._last_error_ts: float = 0.0
+
+    def _note_error(self) -> None:
+        """Record an API error: bump the counter and stamp the time so the
+        circuit breaker can auto-recover after CIRCUIT_BREAKER_COOLDOWN_SEC."""
+        self.error_count += 1
+        self._last_error_ts = _time.time()
+
+    def error_count_effective(self) -> int:
+        """Error count after applying the cooldown. If no error has occurred
+        for CIRCUIT_BREAKER_COOLDOWN_SEC, the breaker resets to 0 so a
+        transient burst doesn't lock entries permanently (previously the
+        cooldown config was defined but never used)."""
+        cooldown = config.CIRCUIT_BREAKER_COOLDOWN_SEC
+        if (self.error_count > 0 and cooldown > 0
+                and _time.time() - self._last_error_ts >= cooldown):
+            log.info("api_breaker_cooldown_reset",
+                     prev=self.error_count, cooldown_sec=cooldown)
+            self.error_count = 0
+        return self.error_count
 
     def connect(self) -> None:
         """Initialize and connect the derive-client."""
@@ -92,7 +112,7 @@ class DeriveExchange:
             return TickerSnapshot()
         except Exception:
             log.warning("get_ticker_failed", instrument=instrument_name, exc_info=True)
-            self.error_count += 1
+            self._note_error()
             return TickerSnapshot()
 
     async def get_tickers_for_expiry(
@@ -119,7 +139,7 @@ class DeriveExchange:
         except Exception:
             log.warning("get_tickers_failed", currency=currency, expiry=expiry_date,
                         exc_info=True)
-            self.error_count += 1
+            self._note_error()
             return {}
 
     async def get_spot_price(self) -> float:
@@ -242,7 +262,7 @@ class DeriveExchange:
                 log.debug("post_only_rejected", instrument=instrument, price=price)
                 return {"rejected_post_only": True}
             log.warning("order_failed", instrument=instrument, error=err_str)
-            self.error_count += 1
+            self._note_error()
             return {}
 
     async def _get_order(self, order_id: str) -> dict:
@@ -730,7 +750,7 @@ class DeriveExchange:
             log.info("rfq_created", rfq_id=rfq_id)
         except Exception:
             log.error("rfq_send_failed", exc_info=True)
-            self.error_count += 1
+            self._note_error()
             return None
 
         best_quote = await self._poll_for_best_quote(rfq_id, legs, timeout=60.0)
@@ -786,7 +806,7 @@ class DeriveExchange:
             }
         except Exception:
             log.error("rfq_execute_failed", rfq_id=rfq_id, exc_info=True)
-            self.error_count += 1
+            self._note_error()
             return None
 
     async def send_rfq_sell(
@@ -819,7 +839,7 @@ class DeriveExchange:
             log.info("rfq_sell_created", rfq_id=rfq_id)
         except Exception:
             log.error("rfq_sell_send_failed", exc_info=True)
-            self.error_count += 1
+            self._note_error()
             return None
 
         best_quote = await self._poll_for_best_quote(rfq_id, legs, timeout=60.0)
@@ -873,7 +893,7 @@ class DeriveExchange:
             }
         except Exception:
             log.error("rfq_sell_execute_failed", rfq_id=rfq_id, exc_info=True)
-            self.error_count += 1
+            self._note_error()
             return None
 
     async def _poll_for_best_quote(

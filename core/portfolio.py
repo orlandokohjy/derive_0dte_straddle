@@ -158,6 +158,15 @@ class Portfolio:
         self._straddle = None
         self._save_positions()
 
+    def reset_state_on_boot(self) -> None:
+        """Deliberate clean-slate on boot (RESET_STATE_ON_BOOT). Clears the
+        in-memory straddle and rewrites positions.json to null. Equity is
+        left intact (it is re-synced from the exchange at startup)."""
+        self._straddle = None
+        self._daily_pnl = 0.0
+        self._save_positions()
+        log.warning("state_reset_on_boot")
+
     # ──────────────── Persistence ─────────────────────────────────
 
     def _save_equity(self) -> None:

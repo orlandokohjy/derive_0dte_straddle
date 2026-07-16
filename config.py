@@ -78,6 +78,49 @@ CONSECUTIVE_FAILURE_LIMIT: int = int(
     os.getenv("CONSECUTIVE_FAILURE_LIMIT", "3")
 )
 
+# ──────────────────── OKX-parity reliability hardening ────────────
+# Persistent post-close re-flatten: after the unwind, if the exchange is
+# NOT flat we loop selling the residual long legs until either the account
+# is flat or this wall-clock budget (minutes) is exhausted. If still not
+# flat at the end, the algo LOCKS entries (orphan) rather than recording a
+# phantom close. CLOSE_FLATTEN_ROUND_MIN is the pause between rounds.
+CLOSE_FLATTEN_BUDGET_MIN: float = float(
+    os.getenv("CLOSE_FLATTEN_BUDGET_MIN", "10.0")
+)
+CLOSE_FLATTEN_ROUND_MIN: float = float(
+    os.getenv("CLOSE_FLATTEN_ROUND_MIN", "1.0")
+)
+
+# Singleton lock: refuse to boot a second algo instance sharing the same
+# session key / subaccount (prevents two processes racing on the same
+# orders). Path is under STATE_DIR. Disable only for tooling.
+SINGLETON_LOCK_ENABLED: bool = os.getenv(
+    "SINGLETON_LOCK_ENABLED", "true",
+).lower() in ("true", "1", "yes", "on")
+
+# Startup chase-pricing self-test: simulate one maker-chase iteration on a
+# live option and abort (entry-lock) if the capped price violates sanity
+# bounds — guards against a unit/tick regression sending a wild price.
+CHASE_SELFTEST_ENABLED: bool = os.getenv(
+    "CHASE_SELFTEST_ENABLED", "true",
+).lower() in ("true", "1", "yes", "on")
+# Capped chase price must not exceed mark × (1 + this).
+CHASE_SELFTEST_MAX_OVER_MARK: float = float(
+    os.getenv("CHASE_SELFTEST_MAX_OVER_MARK", "0.20")
+)
+# Absolute ceiling (USD) on any single-leg option price we would ever pay.
+# A BTC 0DTE option premium should never approach this; a larger value
+# signals a unit bug (e.g. price expressed in the wrong scale).
+CHASE_SELFTEST_MAX_ABSOLUTE_USD: float = float(
+    os.getenv("CHASE_SELFTEST_MAX_ABSOLUTE_USD", "20000.0")
+)
+
+# Optionally wipe local state (positions.json / equity.json) on boot. Off
+# by default; use only for a deliberate clean restart.
+RESET_STATE_ON_BOOT: bool = os.getenv(
+    "RESET_STATE_ON_BOOT", "false",
+).lower() in ("true", "1", "yes", "on")
+
 # ──────────────────── Telegram ────────────────────────────────────
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")

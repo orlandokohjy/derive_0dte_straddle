@@ -9,10 +9,12 @@ Maker-only orders with escalating chase on Derive (formerly Lyra).
 from __future__ import annotations
 
 import asyncio
+import atexit
 import os
 import re
 import signal
 import sys
+import time as _time
 
 import structlog
 
@@ -33,6 +35,66 @@ from utils.time_utils import format_utc_sgt, now_utc
 from utils import volume_tracker
 
 log = structlog.get_logger(__name__)
+
+_LOCK_PATH = f"{config.STATE_DIR}/algo.pid"
+
+
+def _process_alive(pid: int) -> bool:
+    """True if a process with ``pid`` is currently alive on this host."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
+    except Exception:
+        return False
+    return True
+
+
+def _acquire_singleton_lock() -> bool:
+    """Refuse to run a second algo instance on the same session key /
+    subaccount. Writes our PID to ``state/algo.pid``; if the file already
+    holds a LIVE pid, returns False. Stale (dead) pids are overwritten.
+
+    This is the Derive analogue of the OKX singleton lock built after the
+    2026-05-07 incident where two processes raced on the same orders and
+    left an orphan. Especially important under Docker ``restart: always``.
+    """
+    if not config.SINGLETON_LOCK_ENABLED:
+        return True
+    os.makedirs(config.STATE_DIR, exist_ok=True)
+    if os.path.exists(_LOCK_PATH):
+        try:
+            with open(_LOCK_PATH) as f:
+                existing = int((f.read() or "0").strip())
+        except Exception:
+            existing = 0
+        if existing and existing != os.getpid() and _process_alive(existing):
+            log.error("singleton_lock_held", pid=existing, path=_LOCK_PATH)
+            return False
+        log.warning("singleton_lock_stale_overwrite", stale_pid=existing)
+    with open(_LOCK_PATH, "w") as f:
+        f.write(str(os.getpid()))
+    atexit.register(_release_singleton_lock)
+    log.info("singleton_lock_acquired", pid=os.getpid(), path=_LOCK_PATH)
+    return True
+
+
+def _release_singleton_lock() -> None:
+    """Release the singleton lock iff we still own it."""
+    try:
+        if not os.path.exists(_LOCK_PATH):
+            return
+        with open(_LOCK_PATH) as f:
+            owner = int((f.read() or "0").strip())
+        if owner == os.getpid():
+            os.remove(_LOCK_PATH)
+            log.info("singleton_lock_released", pid=os.getpid())
+    except Exception:
+        log.warning("singleton_lock_release_failed", exc_info=True)
 
 
 def _disable_entry_now_in_env_file(env_path: str = ".env") -> None:
@@ -89,11 +151,26 @@ class Algo:
                       hint="Set DERIVE_WALLET and DERIVE_SESSION_KEY in .env")
             sys.exit(1)
 
+        if not _acquire_singleton_lock():
+            log.error("refusing_second_instance", path=_LOCK_PATH)
+            await notifier.send(
+                "<b>⚠️ DERIVE ALGO REFUSED TO START</b>\n"
+                "Another instance holds the singleton lock "
+                f"(<code>{_LOCK_PATH}</code>). Not starting a second copy."
+            )
+            sys.exit(2)
+
+        if config.RESET_STATE_ON_BOOT:
+            self.portfolio.reset_state_on_boot()
+
+        self._validate_chase_deadline_fits_session()
+
         self.exchange.connect()
 
         if not config.DRY_RUN:
             await self._startup_cancel_stale_orders()
             await self._startup_reconcile_positions()
+            await self._chase_pricing_selftest()
 
         spot = await self.exchange.get_spot_price()
 
@@ -141,6 +218,30 @@ class Algo:
         await self._shutdown.wait()
 
     # ──────────────────── Startup Safeguards ──────────────────────
+
+    def _validate_chase_deadline_fits_session(self) -> None:
+        """Lock entries at boot if the entry chase deadline could run past the
+        session close. window = close − entry; the chase must finish with a
+        safety buffer before close so the exit isn't racing an unfilled entry.
+        """
+        entry = config.SESSION_ENTRY_UTC
+        close = config.SESSION_CLOSE_UTC
+        window_min = (close.hour * 60 + close.minute) - (entry.hour * 60 + entry.minute)
+        buffer_min = 5
+        if config.OPTION_CHASE_DEADLINE_MIN > max(0, window_min - buffer_min):
+            self._entry_locked = True
+            self._lock_reason = (
+                f"OPTION_CHASE_DEADLINE_MIN={config.OPTION_CHASE_DEADLINE_MIN} "
+                f"does not fit session window {window_min}min − {buffer_min}min "
+                f"buffer — fix config before trading"
+            )
+            log.error("chase_deadline_exceeds_window",
+                      deadline=config.OPTION_CHASE_DEADLINE_MIN,
+                      window_min=window_min)
+        else:
+            log.info("chase_deadline_fits_session",
+                     deadline=config.OPTION_CHASE_DEADLINE_MIN,
+                     window_min=window_min)
 
     async def _startup_cancel_stale_orders(self) -> None:
         """Cancel any resting orders from a previous run before the scheduler
@@ -225,6 +326,61 @@ class Algo:
                  flat=(not exchange_has_positions and not local_has_straddle),
                  matched_open=(exchange_has_positions and local_has_straddle))
 
+    async def _chase_pricing_selftest(self) -> None:
+        """Simulate one maker-chase cap on a live option and lock entries if
+        the price violates sanity bounds. Guards against a tick/unit
+        regression sending a wild order (the Derive analogue of the OKX
+        chase self-test after the 2026-05-07 unit bug).
+        """
+        if not config.CHASE_SELFTEST_ENABLED:
+            return
+        try:
+            total = await self.chain.refresh()
+            if total == 0:
+                log.info("selftest_skipped_no_chain")
+                return
+            spot = await self.exchange.get_spot_price()
+            pair = select_straddle_pair(self.chain, spot)
+            if pair is None:
+                log.info("selftest_skipped_no_pair")
+                return
+            leg = pair.call
+            mark = float(getattr(leg, "mark", 0.0) or 0.0)
+            ask = float(leg.ask or 0.0)
+            # Price the chase would settle at: walk toward the ask but never
+            # above the mark-based slippage cap.
+            cap = mark * config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR if mark > 0 else ask
+            sim_price = min(ask, cap) if (ask > 0 and cap > 0) else max(ask, cap)
+
+            ok_positive = sim_price > 0 and mark > 0
+            ok_absolute = sim_price <= config.CHASE_SELFTEST_MAX_ABSOLUTE_USD
+            ok_over_mark = (
+                mark <= 0 or sim_price <= mark * (1 + config.CHASE_SELFTEST_MAX_OVER_MARK)
+            )
+            log.info("chase_selftest",
+                     symbol=leg.symbol, mark=mark, ask=ask,
+                     sim_price=sim_price, ok_positive=ok_positive,
+                     ok_absolute=ok_absolute, ok_over_mark=ok_over_mark)
+            if not (ok_positive and ok_absolute and ok_over_mark):
+                self._entry_locked = True
+                self._lock_reason = (
+                    f"Chase self-test failed: sim_price=${sim_price:,.2f} "
+                    f"vs mark=${mark:,.2f} (abs_ok={ok_absolute}, "
+                    f"over_mark_ok={ok_over_mark}) — possible unit/tick bug"
+                )
+                await notifier.send(
+                    f"<b>⚠️ CHASE SELF-TEST FAILED</b>\n"
+                    f"Symbol: <code>{leg.symbol}</code>\n"
+                    f"mark=${mark:,.2f}  ask=${ask:,.2f}  "
+                    f"sim=${sim_price:,.2f}\n"
+                    f"Entries LOCKED — investigate pricing/units before "
+                    f"unlocking (restart)."
+                )
+        except Exception:
+            # A self-test infra failure should not hard-crash the boot, but
+            # we surface it; entries remain allowed only if reconcile passed.
+            log.warning("chase_selftest_error", exc_info=True)
+
     # ──────────────────── Entry ───────────────────────────────────
 
     async def _on_entry(self) -> None:
@@ -242,7 +398,8 @@ class Algo:
             await notifier.notify_skip(f"Entry locked: {self._lock_reason}")
             return
 
-        api_check = self.risk.check_api_health(self.exchange.error_count)
+        api_check = self.risk.check_api_health(
+            self.exchange.error_count_effective())
         if not api_check.allowed:
             log.warning("entry_blocked_api", reason=api_check.reason)
             await notifier.notify_skip(api_check.reason)
@@ -257,6 +414,36 @@ class Algo:
         if self.portfolio.has_open:
             log.warning("already_has_open_straddle")
             return
+
+        # ── Pre-entry exchange-flat guard (defence-in-depth) ──
+        # Local state can be wrong: a failed close can leave the exchange
+        # holding legs even though local state is flat. Query the exchange
+        # directly and refuse (lock) rather than stacking a new straddle on
+        # top of an orphan. Ports the OKX pre-entry flat guard.
+        if not config.DRY_RUN:
+            try:
+                live_positions = await self.exchange.list_open_positions()
+            except Exception:
+                log.warning("preentry_position_check_failed", exc_info=True)
+                live_positions = []
+            if live_positions:
+                detail = ", ".join(
+                    f"{p['instrument_name']} {p['amount']:+.4f}"
+                    for p in live_positions
+                )
+                self._entry_locked = True
+                self._lock_reason = (
+                    f"Pre-entry exchange not flat: {len(live_positions)} "
+                    f"open position(s) — possible orphan, refusing to stack"
+                )
+                log.error("entry_blocked_exchange_not_flat", positions=detail)
+                await notifier.send(
+                    f"<b>⚠️ ENTRY BLOCKED — EXCHANGE NOT FLAT</b>\n"
+                    f"{len(live_positions)} open position(s): {detail}\n\n"
+                    f"<b>ACTION</b>: possible orphan. Entries LOCKED — "
+                    f"flatten manually (tools/force_liquidate.py) and restart."
+                )
+                return
 
         total_options = await self.chain.refresh()
         if total_options == 0:
@@ -392,49 +579,155 @@ class Algo:
 
     # ──────────────────── End-of-session reconciliation ──────────
 
-    async def _post_close_reconcile(self) -> None:
-        """After unwind, verify exchange is actually flat. Alert on orphans."""
+    async def _flatten_residual_until_flat(
+        self, straddle,
+    ) -> tuple[bool, dict[str, float]]:
+        """After the unwind, if the exchange is NOT flat, persistently
+        re-flatten residual legs (sell longs / buy back shorts) until the
+        account is flat or the wall-clock budget is exhausted.
+
+        Returns ``(flat, exit_overrides)`` where ``exit_overrides`` maps a
+        straddle leg instrument to the average price we actually got when
+        re-flattening it (used for accurate close P&L). Ports the OKX
+        ``_flatten_residual_until_flat`` behaviour.
+        """
+        instruments = {
+            straddle.call_leg.instrument, straddle.put_leg.instrument,
+        }
+        overrides: dict[str, float] = {}
+        deadline = _time.monotonic() + config.CLOSE_FLATTEN_BUDGET_MIN * 60.0
+        alerted = False
+        round_i = 0
+
+        while True:
+            try:
+                positions = await self.exchange.list_open_positions()
+            except Exception:
+                log.warning("reflatten_fetch_failed", exc_info=True)
+                positions = None
+
+            if positions is not None:
+                residual = [
+                    p for p in positions
+                    if abs(float(p.get("amount", 0.0))) > 1e-9
+                ]
+                if not residual:
+                    log.info("reflatten_flat", rounds=round_i)
+                    return True, overrides
+
+                round_i += 1
+                if not alerted:
+                    alerted = True
+                    detail = ", ".join(
+                        f"{p['instrument_name']} {float(p['amount']):+.4f}"
+                        for p in residual
+                    )
+                    await notifier.send(
+                        f"<b>🔁 POST-CLOSE RE-FLATTEN</b>\n"
+                        f"Exchange not flat after unwind — re-selling "
+                        f"residual (budget {config.CLOSE_FLATTEN_BUDGET_MIN:.0f} "
+                        f"min): {detail}"
+                    )
+
+                for p in residual:
+                    inst = p["instrument_name"]
+                    amt = float(p.get("amount", 0.0))
+                    try:
+                        ticker = await self.exchange.get_ticker(inst)
+                    except Exception:
+                        log.warning("reflatten_ticker_failed", instrument=inst)
+                        continue
+                    if amt > 0:
+                        initial = ticker.bid if ticker.bid > 0 else ticker.ask
+                        r = await self.exchange.chase_sell(inst, abs(amt), initial)
+                    else:
+                        initial = ticker.ask if ticker.ask > 0 else ticker.bid
+                        r = await self.exchange.chase_buy(inst, abs(amt), initial)
+                    if r and r.get("order_status") != "partial" and inst in instruments:
+                        overrides[inst] = float(r.get("average_price", initial))
+
+            if _time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(config.CLOSE_FLATTEN_ROUND_MIN * 60.0)
+
+        # Final authoritative check.
         try:
             positions = await self.exchange.list_open_positions()
+            flat = not any(
+                abs(float(p.get("amount", 0.0))) > 1e-9 for p in positions
+            )
         except Exception:
-            log.warning("post_close_reconcile_fetch_failed", exc_info=True)
-            return
-
-        if not positions:
-            log.info("post_close_flat_ok")
-            return
-
-        details = "\n".join(
-            f"  • {p['instrument_name']}  amt={p['amount']:+.4f}  "
-            f"mark=${p['mark_price']:,.2f}  uPnL=${p['unrealized_pnl']:+,.2f}"
-            for p in positions
-        )
-        log.warning("post_close_orphan_detected", positions=len(positions))
-        await notifier.send(
-            f"<b>⚠️ POST-CLOSE ORPHAN DETECTED</b>\n"
-            f"Unwind ran but exchange still has {len(positions)} "
-            f"position(s):\n\n"
-            f"{details}\n\n"
-            f"<b>ACTION</b>: investigate & close manually. Next entry "
-            f"will be blocked at startup reconciliation."
-        )
+            log.warning("reflatten_final_check_failed", exc_info=True)
+            flat = False
+        return flat, overrides
 
     # ──────────────────── Close ───────────────────────────────────
 
     async def _on_close(self) -> None:
         try:
+            if not self.portfolio.has_open:
+                log.info("close_nothing_open")
+                return
+
+            straddle = self.portfolio.open_straddle
             equity_before = self.portfolio.equity
-            pnl = await self.exit_mgr.hard_close()
+
+            result = await self.exit_mgr.hard_close(reason="session_close")
+            if result is None:
+                log.info("close_nothing_open")
+                return
+
+            exit_call = result.exit_call_price
+            exit_put = result.exit_put_price
+
+            # ── Reconcile-then-lock ──
+            # Verify the exchange is actually flat before recording ANY close.
+            # If not, persistently re-flatten within budget; if it still is
+            # not flat, LOCK entries (orphan) rather than booking a phantom
+            # close with fabricated exit prices.
+            flat = True
+            if not config.DRY_RUN:
+                flat, overrides = await self._flatten_residual_until_flat(straddle)
+                if straddle.call_leg.instrument in overrides:
+                    exit_call = overrides[straddle.call_leg.instrument]
+                if straddle.put_leg.instrument in overrides:
+                    exit_put = overrides[straddle.put_leg.instrument]
+
+            if not flat:
+                self._entry_locked = True
+                self._lock_reason = (
+                    "Post-close exchange NOT flat after re-flatten budget — "
+                    "orphan; straddle kept OPEN locally, entries locked"
+                )
+                log.error("post_close_not_flat_lock", id=straddle.id)
+                await notifier.send(
+                    f"<b>⚠️ POST-CLOSE ORPHAN — ENTRIES LOCKED</b>\n"
+                    f"Straddle <code>{straddle.id}</code> could not be fully "
+                    f"flattened within the re-flatten budget.\n\n"
+                    f"Local state kept OPEN (no phantom close). "
+                    f"<b>ACTION</b>: flatten manually "
+                    f"(tools/force_liquidate.py) and restart."
+                )
+                return
+
+            # Confirmed flat → finalise the close (records P&L + trade log).
+            if not result.both_sold:
+                log.info("close_finalized_via_reflatten", id=straddle.id)
+            pnl = self.portfolio.close_straddle(
+                exit_call, exit_put, "session_close",
+            )
+            await notifier.notify_close(pnl, "session_close")
 
             if not config.DRY_RUN:
                 live_equity = await self.exchange.get_subaccount_equity()
                 if live_equity > 0:
                     self.portfolio.sync_equity(live_equity)
-                await self._post_close_reconcile()
 
             actual_pnl = self.portfolio.equity - equity_before
             if actual_pnl != 0.0:
-                cum_return = (self.portfolio.equity - config.INITIAL_CAPITAL_USD) / config.INITIAL_CAPITAL_USD
+                cum_return = (
+                    self.portfolio.equity - config.INITIAL_CAPITAL_USD
+                ) / config.INITIAL_CAPITAL_USD
                 await notifier.notify_daily_summary(
                     self.portfolio.equity, actual_pnl, cum_return,
                 )
@@ -474,10 +767,21 @@ class Algo:
 
         if self.portfolio.has_open:
             log.warning("closing_remaining_position")
-            await unwind_straddle(
+            straddle = self.portfolio.open_straddle
+            result = await unwind_straddle(
                 self.exchange, self.market, self.portfolio, reason="shutdown",
             )
+            # Best-effort finalise on shutdown. We do not run the full
+            # re-flatten budget here (we're exiting); the next boot's startup
+            # reconcile is the backstop if a leg failed to sell.
+            if result is not None:
+                self.portfolio.close_straddle(
+                    result.exit_call_price, result.exit_put_price, "shutdown",
+                )
+                if not result.both_sold:
+                    log.warning("shutdown_unwind_incomplete", id=straddle.id)
 
+        _release_singleton_lock()
         log.info("algo_stopped")
         self._shutdown.set()
 

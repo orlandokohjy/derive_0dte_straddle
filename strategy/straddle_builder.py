@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from dataclasses import dataclass
 from typing import Optional
 
 import structlog
@@ -23,6 +24,28 @@ from strategy.option_selector import StraddlePair
 from utils.time_utils import now_utc
 
 log = structlog.get_logger(__name__)
+
+
+@dataclass
+class UnwindResult:
+    """Outcome of a straddle unwind attempt.
+
+    Deliberately does NOT record the close in the portfolio — the caller
+    (main._on_close) reconciles against the exchange and only finalises the
+    close (or locks on an orphan) once flatness is confirmed. This is the
+    reconcile-then-lock fix for the phantom-close bug where a failed maker
+    sell used to fall back to the ENTRY price and mark the straddle closed
+    while the exchange still held the legs.
+    """
+    exit_call_price: float
+    exit_put_price: float
+    call_sold: bool
+    put_sold: bool
+    atomic: bool  # RFQ atomic sell succeeded (both legs)
+
+    @property
+    def both_sold(self) -> bool:
+        return self.atomic or (self.call_sold and self.put_sold)
 
 
 def _spread_pct(bid: float, ask: float) -> float:
@@ -104,8 +127,12 @@ async def build_straddle(
 
         call_result = await exchange.chase_buy(
             pair.call.symbol, total_qty, pair.call.bid)
-        if call_result is None:
-            log.error("call_buy_failed", id=straddle_id, symbol=pair.call.symbol)
+        if call_result is None or call_result.get("order_status") == "partial":
+            log.error("call_buy_failed_or_partial", id=straddle_id,
+                      symbol=pair.call.symbol, partial=bool(call_result))
+            # A partial fill leaves a live long leg — flatten it so we don't
+            # leave an orphan behind a failed entry.
+            await _emergency_flatten(exchange, pair.call.symbol)
             return None
 
         call_fill = float(call_result.get("average_price", pair.call.bid))
@@ -120,9 +147,12 @@ async def build_straddle(
 
         put_result = await exchange.chase_buy(
             pair.put.symbol, total_qty, pair.put.bid)
-        if put_result is None:
-            log.error("put_buy_failed", id=straddle_id, symbol=pair.put.symbol)
-            await _emergency_sell(exchange, pair.call.symbol, total_qty, call_fill)
+        if put_result is None or put_result.get("order_status") == "partial":
+            log.error("put_buy_failed_or_partial", id=straddle_id,
+                      symbol=pair.put.symbol, partial=bool(put_result))
+            # Roll back the filled call AND any partial put leg.
+            await _emergency_flatten(exchange, pair.call.symbol)
+            await _emergency_flatten(exchange, pair.put.symbol)
             return None
 
         put_fill = float(put_result.get("average_price", pair.put.bid))
@@ -163,15 +193,24 @@ async def unwind_straddle(
     market: MarketData,
     portfolio: Portfolio,
     reason: str = "hard_close",
-) -> float:
+) -> Optional[UnwindResult]:
     """
-    Close the open straddle.
+    Attempt to close the open straddle. Returns an ``UnwindResult`` (or
+    ``None`` if nothing is open).
+
     Primary: RFQ sell both legs atomically.
     Fallback: individual leg chasing.
+
+    IMPORTANT: this function no longer records the close in the portfolio.
+    It reports exactly which legs actually SOLD so the caller can reconcile
+    against exchange truth and only finalise the close once flatness is
+    confirmed. On a failed sell the exit price falls back to the last mark /
+    entry price purely for reporting; ``call_sold`` / ``put_sold`` tell the
+    caller whether that price is real.
     """
     straddle = portfolio.open_straddle
     if straddle is None:
-        return 0.0
+        return None
 
     log.info("unwinding", id=straddle.id, reason=reason, method="rfq")
 
@@ -187,50 +226,85 @@ async def unwind_straddle(
         exit_put_price = rfq_result["put_price"]
         log.info("rfq_unwind_filled", id=straddle.id,
                  call_exit=exit_call_price, put_exit=exit_put_price)
-    else:
-        # ── Fallback: individual leg chasing ──
-        log.warning("rfq_sell_failed_fallback_to_chase", id=straddle.id)
+        return UnwindResult(
+            exit_call_price=exit_call_price, exit_put_price=exit_put_price,
+            call_sold=True, put_sold=True, atomic=True,
+        )
 
-        exit_call_price = straddle.entry_call_price
-        _, call_ask = await market.get_option_bid_ask(straddle.call_leg.instrument)
-        if call_ask > 0:
-            result = await exchange.chase_sell(
-                straddle.call_leg.instrument, straddle.call_leg.qty, call_ask)
-            if result:
-                exit_call_price = float(result.get("average_price", call_ask))
-                log.info("call_sold", price=exit_call_price)
-            else:
-                log.warning("call_sell_failed",
-                            instrument=straddle.call_leg.instrument)
+    # ── Fallback: individual leg chasing ──
+    log.warning("rfq_sell_failed_fallback_to_chase", id=straddle.id)
 
-        exit_put_price = straddle.entry_put_price
-        _, put_ask = await market.get_option_bid_ask(straddle.put_leg.instrument)
-        if put_ask > 0:
-            result = await exchange.chase_sell(
-                straddle.put_leg.instrument, straddle.put_leg.qty, put_ask)
-            if result:
-                exit_put_price = float(result.get("average_price", put_ask))
-                log.info("put_sold", price=exit_put_price)
-            else:
-                log.warning("put_sell_failed",
-                            instrument=straddle.put_leg.instrument)
-
-    pnl = portfolio.close_straddle(exit_call_price, exit_put_price, reason)
-    log.info("straddle_unwound", id=straddle.id, reason=reason,
-             pnl=f"${pnl:,.2f}", exit_call=exit_call_price, exit_put=exit_put_price)
-    return pnl
-
-
-async def _emergency_sell(exchange: DeriveExchange, instrument: str,
-                          qty: float, entry_price: float) -> None:
-    """Attempt to sell a leg that was already filled during a failed build."""
-    try:
-        ticker = await exchange.get_ticker(instrument)
-        ask = ticker.ask if ticker.ask > 0 else entry_price
-        result = await exchange.chase_sell(instrument, qty, ask)
-        if result:
-            log.info("emergency_sell_done", instrument=instrument)
+    call_sold = False
+    exit_call_price = straddle.entry_call_price
+    _, call_ask = await market.get_option_bid_ask(straddle.call_leg.instrument)
+    if call_ask > 0:
+        result = await exchange.chase_sell(
+            straddle.call_leg.instrument, straddle.call_leg.qty, call_ask)
+        if result and result.get("order_status") != "partial":
+            exit_call_price = float(result.get("average_price", call_ask))
+            call_sold = True
+            log.info("call_sold", price=exit_call_price)
         else:
-            log.error("emergency_sell_chase_exhausted", instrument=instrument)
+            log.warning("call_sell_failed",
+                        instrument=straddle.call_leg.instrument,
+                        partial=bool(result))
+
+    put_sold = False
+    exit_put_price = straddle.entry_put_price
+    _, put_ask = await market.get_option_bid_ask(straddle.put_leg.instrument)
+    if put_ask > 0:
+        result = await exchange.chase_sell(
+            straddle.put_leg.instrument, straddle.put_leg.qty, put_ask)
+        if result and result.get("order_status") != "partial":
+            exit_put_price = float(result.get("average_price", put_ask))
+            put_sold = True
+            log.info("put_sold", price=exit_put_price)
+        else:
+            log.warning("put_sell_failed",
+                        instrument=straddle.put_leg.instrument,
+                        partial=bool(result))
+
+    return UnwindResult(
+        exit_call_price=exit_call_price, exit_put_price=exit_put_price,
+        call_sold=call_sold, put_sold=put_sold, atomic=False,
+    )
+
+
+async def _emergency_flatten(exchange: DeriveExchange, instrument: str) -> None:
+    """Position-aware rollback of a leg left live by a failed/partial build.
+
+    Reads the ACTUAL exchange position for ``instrument`` and chases it flat
+    (sells a long, buys back a short), rather than trusting an assumed qty —
+    this cannot oversell into a short. No-op if already flat. In DRY_RUN
+    ``list_open_positions`` is empty so this is a safe no-op.
+    """
+    from core import notifier
+    try:
+        positions = await exchange.list_open_positions()
+        target = next(
+            (p for p in positions if p["instrument_name"] == instrument), None,
+        )
+        amt = float(target.get("amount", 0.0)) if target else 0.0
+        if abs(amt) < 1e-9:
+            log.info("emergency_flatten_already_flat", instrument=instrument)
+            return
+        ticker = await exchange.get_ticker(instrument)
+        if amt > 0:
+            initial = ticker.bid if ticker.bid > 0 else ticker.ask
+            result = await exchange.chase_sell(instrument, abs(amt), initial)
+        else:
+            initial = ticker.ask if ticker.ask > 0 else ticker.bid
+            result = await exchange.chase_buy(instrument, abs(amt), initial)
+        if result and result.get("order_status") != "partial":
+            log.info("emergency_flatten_done", instrument=instrument, amt=amt)
+        else:
+            log.error("emergency_flatten_incomplete",
+                      instrument=instrument, amt=amt, partial=bool(result))
+            await notifier.send(
+                f"<b>⚠️ MANUAL ACTION REQUIRED</b>\n"
+                f"Emergency flatten of <code>{instrument}</code> did not "
+                f"complete (residual {amt:+.4f}). Check & flatten manually."
+            )
     except Exception:
-        log.error("emergency_sell_failed", instrument=instrument, exc_info=True)
+        log.error("emergency_flatten_failed", instrument=instrument,
+                  exc_info=True)
