@@ -22,33 +22,32 @@ class Scheduler:
         self, on_entry: callable, on_close: callable, on_report: callable,
         on_weekly_report: callable | None = None,
     ) -> None:
-        weekdays = ",".join(
-            ["mon", "tue", "wed", "thu", "fri"][d] for d in sorted(config.ALLOWED_WEEKDAYS)
-        )
-
-        entry_t = config.SESSION_ENTRY_UTC
-        self._scheduler.add_job(
-            on_entry,
-            CronTrigger(
-                hour=entry_t.hour, minute=entry_t.minute,
-                day_of_week=weekdays, timezone=UTC,
-            ),
-            id="session_entry",
-            name=f"Session Entry ({entry_t.hour:02d}:{entry_t.minute:02d} UTC)",
-            replace_existing=True,
-        )
-
-        close_t = config.SESSION_CLOSE_UTC
-        self._scheduler.add_job(
-            on_close,
-            CronTrigger(
-                hour=close_t.hour, minute=close_t.minute,
-                day_of_week=weekdays, timezone=UTC,
-            ),
-            id="session_close",
-            name=f"Session Close ({close_t.hour:02d}:{close_t.minute:02d} UTC)",
-            replace_existing=True,
-        )
+        # Register an entry + close cron per session in the (multi-session)
+        # SESSION_SCHEDULE. Handlers are session-agnostic: entry opens a
+        # straddle if none is open, close unwinds whatever is open. Because
+        # the schedule is contiguous (close = next_entry − buffer) windows
+        # never overlap, so the single-straddle model still holds.
+        for spec in config.SESSION_SCHEDULE:
+            self._scheduler.add_job(
+                on_entry,
+                CronTrigger(
+                    hour=spec.entry_utc.hour, minute=spec.entry_utc.minute,
+                    day_of_week=",".join(spec.entry_days), timezone=UTC,
+                ),
+                id=f"session_entry_{spec.name}",
+                name=f"Session Entry [{spec.name}] ({spec.label})",
+                replace_existing=True,
+            )
+            self._scheduler.add_job(
+                on_close,
+                CronTrigger(
+                    hour=spec.close_utc.hour, minute=spec.close_utc.minute,
+                    day_of_week=",".join(spec.close_days), timezone=UTC,
+                ),
+                id=f"session_close_{spec.name}",
+                name=f"Session Close [{spec.name}] ({spec.label})",
+                replace_existing=True,
+            )
 
         report_t = config.REPORT_UTC
         self._scheduler.add_job(
@@ -76,12 +75,17 @@ class Scheduler:
             )
 
         log.info(
-            "session_scheduled",
-            entry=f"{entry_t.hour:02d}:{entry_t.minute:02d} UTC",
-            close=f"{close_t.hour:02d}:{close_t.minute:02d} UTC",
+            "sessions_scheduled",
+            sessions=[
+                f"{s.name} {s.label} [{','.join(s.entry_days)}]"
+                for s in config.SESSION_SCHEDULE
+            ],
+            count=len(config.SESSION_SCHEDULE),
             report=f"{report_t.hour:02d}:{report_t.minute:02d} UTC",
-            weekly_report=f"Fri {config.WEEKLY_REPORT_UTC.hour:02d}:{config.WEEKLY_REPORT_UTC.minute:02d} UTC",
-            days=weekdays,
+            weekly_report=(
+                f"Fri {config.WEEKLY_REPORT_UTC.hour:02d}:"
+                f"{config.WEEKLY_REPORT_UTC.minute:02d} UTC"
+            ),
         )
 
     def start(self) -> None:

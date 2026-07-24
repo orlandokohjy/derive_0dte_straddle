@@ -6,6 +6,7 @@ All tunables in one place. Env-var overrides for deployment.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from datetime import time
 
 # ──────────────────── Derive Credentials ──────────────────────────
@@ -37,11 +38,122 @@ ALLOC_PCT: float = 0.80
 NUM_STRADDLES_OVERRIDE: int = int(os.getenv("NUM_STRADDLES_OVERRIDE", "1"))  # >0 forces exact count; default 1 to prevent auto-sizing multiple straddles
 
 # ──────────────────── Session Schedule (UTC) ──────────────────────
-SESSION_ENTRY_UTC: time = time(12, 0)
-SESSION_CLOSE_UTC: time = time(14, 0)
+# MULTI-SESSION schedule mirroring the OKX ATM-wings stack EXACTLY (minus
+# wings — this stack never sells wings). Each window holds 30 min, except
+# where the next entry is 30 min away, in which case the close rolls to
+# ``next_entry − _SESSION_ROLL_BUFFER_MIN`` (chained roll, so consecutive
+# windows never overlap → the single-straddle model still holds). All
+# entries are ≥ 09:00 UTC (after the 08:00 expiry cutoff) so every session
+# trades the next 08:00-UTC expiry, same as the current 12:00 session.
+_SESSION_ROLL_BUFFER_MIN: int = 5
+
+_WEEKDAY_ENTRIES: list[tuple[str, int, int]] = [
+    ("wd_0900", 9, 0),
+    ("wd_1100", 11, 0),
+    ("wd_1130", 11, 30),
+    ("wd_1200", 12, 0),
+    ("wd_1230", 12, 30),
+    ("wd_1300", 13, 0),
+    ("wd_1330", 13, 30),
+    ("wd_1400", 14, 0),
+    ("wd_1430", 14, 30),
+    ("wd_1500", 15, 0),
+    ("wd_1530", 15, 30),
+    ("wd_2330", 23, 30),
+]
+_WEEKDAY_DOW: tuple[str, ...] = ("mon", "tue", "wed", "thu", "fri")
+
+_WEEKEND_ENTRIES: list[tuple[str, int, int]] = [
+    ("we_1100", 11, 0),
+    ("we_1200", 12, 0),
+    ("we_1230", 12, 30),
+    ("we_1330", 13, 30),
+    ("we_1430", 14, 30),
+    ("we_1500", 15, 0),
+    ("we_1700", 17, 0),
+    ("we_1900", 19, 0),
+    ("we_2200", 22, 0),
+]
+_WEEKEND_DOW: tuple[str, ...] = ("sat", "sun")
+
+_DOW_ORDER: tuple[str, ...] = (
+    "mon", "tue", "wed", "thu", "fri", "sat", "sun",
+)
+
+
+def _derive_close(entry_h: int, entry_m: int, next_entry_min: int | None) -> time:
+    """Close = entry+30 unless the next entry is exactly 30 min away (a
+    chained roll), in which case close = next_entry − buffer. Wraps past
+    midnight (e.g. 23:30 + 30 = 00:00)."""
+    entry_min = entry_h * 60 + entry_m
+    full_close_min = entry_min + 30
+    if next_entry_min is not None and next_entry_min == full_close_min:
+        close_min = next_entry_min - _SESSION_ROLL_BUFFER_MIN
+    else:
+        close_min = full_close_min
+    close_min %= (24 * 60)
+    return time(close_min // 60, close_min % 60)
+
+
+def _shift_days(days: tuple[str, ...]) -> tuple[str, ...]:
+    """Shift each weekday token forward one day (for a cross-midnight close
+    whose cron must fire on the following calendar day)."""
+    return tuple(
+        _DOW_ORDER[(_DOW_ORDER.index(d) + 1) % 7] for d in days
+    )
+
+
+@dataclass(frozen=True)
+class SessionSpec:
+    name: str
+    entry_utc: time
+    close_utc: time
+    entry_days: tuple[str, ...]   # cron day-of-week tokens for the ENTRY cron
+    close_days: tuple[str, ...]   # cron day-of-week tokens for the CLOSE cron
+
+    @property
+    def window_min(self) -> int:
+        e = self.entry_utc.hour * 60 + self.entry_utc.minute
+        c = self.close_utc.hour * 60 + self.close_utc.minute
+        if c <= e:  # crosses midnight
+            c += 24 * 60
+        return c - e
+
+    @property
+    def label(self) -> str:
+        return (
+            f"{self.entry_utc.strftime('%H:%M')}-"
+            f"{self.close_utc.strftime('%H:%M')} UTC"
+        )
+
+
+def _build_specs(
+    entries: list[tuple[str, int, int]], dow: tuple[str, ...],
+) -> list[SessionSpec]:
+    entry_mins = {h * 60 + m for (_, h, m) in entries}
+    specs: list[SessionSpec] = []
+    for (name, h, m) in entries:
+        nxt = h * 60 + m + 30
+        next_entry_min = nxt if nxt in entry_mins else None
+        close = _derive_close(h, m, next_entry_min)
+        crosses = (close.hour * 60 + close.minute) <= (h * 60 + m)
+        close_days = _shift_days(dow) if crosses else dow
+        specs.append(SessionSpec(name, time(h, m), close, dow, close_days))
+    return specs
+
+
+SESSION_SCHEDULE: list[SessionSpec] = (
+    _build_specs(_WEEKDAY_ENTRIES, _WEEKDAY_DOW)
+    + _build_specs(_WEEKEND_ENTRIES, _WEEKEND_DOW)
+)
+
+# Legacy single-session anchors — kept for any introspection / backward
+# reference. Scheduling now runs off SESSION_SCHEDULE above.
+SESSION_ENTRY_UTC: time = SESSION_SCHEDULE[0].entry_utc
+SESSION_CLOSE_UTC: time = SESSION_SCHEDULE[0].close_utc
 REPORT_UTC: time = time(15, 0)
 WEEKLY_REPORT_UTC: time = time(16, 0)
-ALLOWED_WEEKDAYS: set[int] = {0, 1, 2, 3, 4}  # Mon–Fri
+ALLOWED_WEEKDAYS: set[int] = {0, 1, 2, 3, 4}  # Mon–Fri (legacy)
 
 # ──────────────────── Execution Settings ──────────────────────────
 OPTION_CHASE_INTERVAL_SEC: float = 5.0

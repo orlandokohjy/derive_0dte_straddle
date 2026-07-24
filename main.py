@@ -186,6 +186,18 @@ class Algo:
 
         lock_line = (f"\n<b>⚠️ ENTRY LOCKED</b>: {self._lock_reason}"
                      if self._entry_locked else "")
+        wd_sessions = [s for s in config.SESSION_SCHEDULE
+                       if "mon" in s.entry_days]
+        we_sessions = [s for s in config.SESSION_SCHEDULE
+                       if "sat" in s.entry_days]
+        sched_line = (
+            f"\nSessions ({len(config.SESSION_SCHEDULE)}):\n"
+            f"  • Mon-Fri: "
+            f"{', '.join(s.entry_utc.strftime('%H:%M') for s in wd_sessions)}\n"
+            f"  • Sat-Sun: "
+            f"{', '.join(s.entry_utc.strftime('%H:%M') for s in we_sessions)}\n"
+            f"  (30-min holds, no wings)"
+        )
         await notifier.send(
             f"<b>DERIVE STRADDLE ALGO STARTED</b>\n"
             f"Env: {config.DERIVE_ENV}"
@@ -193,6 +205,7 @@ class Algo:
             f"Spot: ${spot:,.2f}\n"
             f"Equity: ${self.portfolio.equity:,.2f}\n"
             f"Time: {format_utc_sgt(now_utc())}"
+            f"{sched_line}"
             f"{lock_line}\n"
         )
 
@@ -224,24 +237,29 @@ class Algo:
         session close. window = close − entry; the chase must finish with a
         safety buffer before close so the exit isn't racing an unfilled entry.
         """
-        entry = config.SESSION_ENTRY_UTC
-        close = config.SESSION_CLOSE_UTC
-        window_min = (close.hour * 60 + close.minute) - (entry.hour * 60 + entry.minute)
+        # Validate against the SHORTEST session window in the multi-session
+        # schedule — the chase must finish with a safety buffer before the
+        # tightest close, or the exit races an unfilled entry.
         buffer_min = 5
+        shortest = min(config.SESSION_SCHEDULE, key=lambda s: s.window_min)
+        window_min = shortest.window_min
         if config.OPTION_CHASE_DEADLINE_MIN > max(0, window_min - buffer_min):
             self._entry_locked = True
             self._lock_reason = (
                 f"OPTION_CHASE_DEADLINE_MIN={config.OPTION_CHASE_DEADLINE_MIN} "
-                f"does not fit session window {window_min}min − {buffer_min}min "
-                f"buffer — fix config before trading"
+                f"does not fit shortest session window "
+                f"({shortest.name} {window_min}min) − {buffer_min}min "
+                f"buffer — lower OPTION_CHASE_DEADLINE_MIN before trading"
             )
             log.error("chase_deadline_exceeds_window",
                       deadline=config.OPTION_CHASE_DEADLINE_MIN,
+                      shortest_session=shortest.name,
                       window_min=window_min)
         else:
-            log.info("chase_deadline_fits_session",
+            log.info("chase_deadline_fits_all_sessions",
                      deadline=config.OPTION_CHASE_DEADLINE_MIN,
-                     window_min=window_min)
+                     shortest_session=shortest.name,
+                     shortest_window_min=window_min)
 
     async def _startup_cancel_stale_orders(self) -> None:
         """Cancel any resting orders from a previous run before the scheduler
