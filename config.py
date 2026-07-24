@@ -202,6 +202,13 @@ CLOSE_FLATTEN_BUDGET_MIN: float = float(
 CLOSE_FLATTEN_ROUND_MIN: float = float(
     os.getenv("CLOSE_FLATTEN_ROUND_MIN", "1.0")
 )
+# Taker escalation (OKX parity): after this many maker-only re-flatten
+# rounds fail to clear a residual leg, the post-close reconcile crosses the
+# spread with a TAKER order to guarantee the close, rather than locking as
+# an orphan. Set very high to keep the reconcile maker-only.
+CLOSE_FLATTEN_TAKER_AFTER_ROUNDS: int = int(
+    os.getenv("CLOSE_FLATTEN_TAKER_AFTER_ROUNDS", "2")
+)
 
 # Singleton lock: refuse to boot a second algo instance sharing the same
 # session key / subaccount (prevents two processes racing on the same

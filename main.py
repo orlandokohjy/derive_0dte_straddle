@@ -1,10 +1,11 @@
 """
 Derive 0DTE BTC Pure Straddle Algo.
 
-Single daily session: 12:00–14:00 UTC, Mon–Fri.
-Position: 1 ITM call + 1 put (same strike) per QTY_PER_LEG BTC.
+Multi-session schedule mirroring the OKX ATM-wings timing (no wings).
+Position: 1 ATM call + 1 put (nearest strike to spot) per QTY_PER_LEG BTC.
 Compound sizing: 80% of current equity, no cap on straddles.
-Maker-only orders with escalating chase on Derive (formerly Lyra).
+Maker-only orders with escalating chase on Derive (formerly Lyra); the
+post-close reconcile taker-escalates after CLOSE_FLATTEN_TAKER_AFTER_ROUNDS.
 """
 from __future__ import annotations
 
@@ -615,6 +616,7 @@ class Algo:
         overrides: dict[str, float] = {}
         deadline = _time.monotonic() + config.CLOSE_FLATTEN_BUDGET_MIN * 60.0
         alerted = False
+        taker_alerted = False
         round_i = 0
 
         while True:
@@ -647,9 +649,29 @@ class Algo:
                         f"min): {detail}"
                     )
 
+                # Taker escalation (OKX parity): after N maker rounds fail
+                # to clear the residual, cross the spread with a TAKER order
+                # to guarantee the close instead of locking as an orphan.
+                use_taker = round_i > config.CLOSE_FLATTEN_TAKER_AFTER_ROUNDS
+                if use_taker and not taker_alerted:
+                    taker_alerted = True
+                    await notifier.send(
+                        f"<b>⚠️ RE-FLATTEN → TAKER</b>\n"
+                        f"{config.CLOSE_FLATTEN_TAKER_AFTER_ROUNDS} maker "
+                        f"round(s) did not clear the residual — crossing the "
+                        f"spread (taker) to guarantee the close."
+                    )
+
                 for p in residual:
                     inst = p["instrument_name"]
                     amt = float(p.get("amount", 0.0))
+                    if use_taker:
+                        r = await self.exchange.taker_flatten(inst, amt)
+                        if r and inst in instruments:
+                            avg = float(r.get("average_price", 0.0))
+                            if avg > 0:
+                                overrides[inst] = avg
+                        continue
                     try:
                         ticker = await self.exchange.get_ticker(inst)
                     except Exception:

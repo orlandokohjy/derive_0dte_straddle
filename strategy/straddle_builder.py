@@ -1,7 +1,7 @@
 """
 Atomic straddle construction and teardown via RFQ.
 
-One straddle = 1 ITM call + 1 put (same strike) per QTY_PER_LEG BTC.
+One straddle = 1 ATM call + 1 put (nearest strike to spot) per QTY_PER_LEG BTC.
 
 Entry: RFQ (buy call + buy put) → atomic fill
 Exit:  RFQ (sell call + sell put) → atomic fill

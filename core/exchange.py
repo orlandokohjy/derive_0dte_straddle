@@ -265,6 +265,48 @@ class DeriveExchange:
             self._note_error()
             return {}
 
+    async def taker_flatten(
+        self, instrument: str, signed_amt: float,
+    ) -> Optional[dict]:
+        """Flatten one leg with a TAKER cross (post_only=False), guaranteeing
+        a fill by crossing the spread. Used by the post-close reconcile as an
+        escalation after maker rounds fail (OKX parity). ``signed_amt`` is the
+        live position (+long / −short, in BTC): a long is SOLD at the bid, a
+        short is BOUGHT at the ask. Returns the order dict on success (with
+        ``average_price``), or None on a bad book / rejection.
+        """
+        qty = abs(signed_amt)
+        if qty < 1e-9:
+            return None
+        try:
+            ticker = await self.get_ticker(instrument)
+        except Exception:
+            log.warning("taker_flatten_ticker_failed", instrument=instrument)
+            return None
+        bid, ask = float(ticker.bid), float(ticker.ask)
+        if bid <= 0 or ask <= 0:
+            log.warning("taker_flatten_bad_book", instrument=instrument,
+                        bid=bid, ask=ask)
+            return None
+        if signed_amt > 0:
+            direction, price = "sell", bid   # cross DOWN to guarantee fill
+        else:
+            direction, price = "buy", ask     # cross UP
+        log.warning("taker_flatten_crossing", instrument=instrument,
+                    direction=direction, qty=qty, price=price,
+                    book=f"{bid}/{ask}")
+        order = await self._place_limit_order(
+            instrument, direction, qty, price, post_only=False,
+        )
+        if order.get("rejected_insufficient_funds"):
+            log.error("taker_flatten_insufficient_funds", instrument=instrument)
+            return None
+        if not order.get("order_id"):
+            log.error("taker_flatten_not_accepted", instrument=instrument,
+                      order=order)
+            return None
+        return order
+
     async def _get_order(self, order_id: str) -> dict:
         """Get the state of a single order."""
         try:
