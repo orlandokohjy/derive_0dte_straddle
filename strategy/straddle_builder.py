@@ -1,11 +1,14 @@
 """
-Atomic straddle construction and teardown via RFQ.
+Straddle construction and teardown via maker-only leg chasing.
 
 One straddle = 1 ATM call + 1 put (nearest strike to spot) per QTY_PER_LEG BTC.
 
-Entry: RFQ (buy call + buy put) → atomic fill
-Exit:  RFQ (sell call + sell put) → atomic fill
-Fallback: individual leg chasing if RFQ fails.
+Entry: chase_buy each leg (post-only maker) — call then put.
+Exit:  chase_sell each leg (post-only maker) — call then put.
+
+RFQ is deliberately NOT used: RFQ execution crosses the maker's quote and
+therefore fills as a TAKER. To match the OKX stacks (maker-only, post-only),
+every fill here goes through the post-only chase in core.exchange.
 """
 from __future__ import annotations
 
@@ -41,7 +44,7 @@ class UnwindResult:
     exit_put_price: float
     call_sold: bool
     put_sold: bool
-    atomic: bool  # RFQ atomic sell succeeded (both legs)
+    atomic: bool  # retained for API compat; always False (maker chase only)
 
     @property
     def both_sold(self) -> bool:
@@ -63,10 +66,11 @@ async def build_straddle(
     num_straddles: int,
 ) -> Optional[Straddle]:
     """
-    Execute the atomic entry for N identical straddle units.
+    Execute the entry for N identical straddle units, maker-only.
 
-    Primary: RFQ for both legs atomically.
-    Fallback: individual leg chasing if RFQ produces no quotes.
+    Both legs are bought via the post-only chase (call then put). A partial
+    or failed leg is rolled back with a position-aware emergency flatten so a
+    failed entry never leaves an orphan behind.
     """
     from core import notifier
 
@@ -75,7 +79,7 @@ async def build_straddle(
 
     log.info("building_straddle", id=straddle_id, strike=pair.strike,
              call=pair.call.symbol, put=pair.put.symbol, num=num_straddles,
-             method="rfq")
+             method="maker_chase")
 
     # ── Pre-entry spread gate ──
     call_spread = _spread_pct(pair.call.bid, pair.call.ask)
@@ -99,71 +103,69 @@ async def build_straddle(
         )
         return None
 
-    # ── Primary: RFQ atomic entry ──
-    rfq_result = await exchange.send_rfq(
-        pair.call.symbol, pair.put.symbol, total_qty)
+    # ── Maker-only entry: chase each leg post-only (call then put) ──
+    call_result = await exchange.chase_buy(
+        pair.call.symbol, total_qty, pair.call.bid)
+    if call_result is None or call_result.get("order_status") == "partial":
+        log.error("call_buy_failed_or_partial", id=straddle_id,
+                  symbol=pair.call.symbol, partial=bool(call_result))
+        # A partial fill leaves a live long leg — flatten it so we don't
+        # leave an orphan behind a failed entry.
+        await _emergency_flatten(exchange, pair.call.symbol)
+        return None
 
-    if rfq_result is not None:
-        call_fill = rfq_result["call_price"]
-        put_fill = rfq_result["put_price"]
-        rfq_id = rfq_result["rfq_id"]
-
-        log.info("rfq_straddle_filled", id=straddle_id, rfq_id=rfq_id,
-                 call_price=call_fill, put_price=put_fill)
-
-        call_leg = StraddleLeg(
-            instrument=pair.call.symbol, side="Buy",
-            qty=total_qty, entry_price=call_fill,
-            order_id=rfq_id, avg_fill_price=call_fill,
+    call_fill = float(call_result.get("average_price", 0) or 0)
+    if call_fill <= 0:
+        # Never record a $0 cost basis — roll back and skip.
+        log.error("call_fill_zero_price", id=straddle_id,
+                  symbol=pair.call.symbol, result=call_result)
+        await _emergency_flatten(exchange, pair.call.symbol)
+        await notifier.send(
+            f"<b>⚠️ ENTRY ABORTED — bad call fill</b> [{straddle_id}]\n"
+            f"chase_buy returned a $0 fill price for "
+            f"<code>{pair.call.symbol}</code>. Rolled back; no position taken."
         )
-        put_leg = StraddleLeg(
-            instrument=pair.put.symbol, side="Buy",
-            qty=total_qty, entry_price=put_fill,
-            order_id=rfq_id, avg_fill_price=put_fill,
+        return None
+    log.info("call_filled", id=straddle_id, price=call_fill)
+
+    call_leg = StraddleLeg(
+        instrument=pair.call.symbol, side="Buy",
+        qty=total_qty, entry_price=call_fill,
+        order_id=call_result.get("order_id", ""),
+        avg_fill_price=call_fill,
+    )
+
+    put_result = await exchange.chase_buy(
+        pair.put.symbol, total_qty, pair.put.bid)
+    if put_result is None or put_result.get("order_status") == "partial":
+        log.error("put_buy_failed_or_partial", id=straddle_id,
+                  symbol=pair.put.symbol, partial=bool(put_result))
+        # Roll back the filled call AND any partial put leg.
+        await _emergency_flatten(exchange, pair.call.symbol)
+        await _emergency_flatten(exchange, pair.put.symbol)
+        return None
+
+    put_fill = float(put_result.get("average_price", 0) or 0)
+    if put_fill <= 0:
+        log.error("put_fill_zero_price", id=straddle_id,
+                  symbol=pair.put.symbol, result=put_result)
+        await _emergency_flatten(exchange, pair.call.symbol)
+        await _emergency_flatten(exchange, pair.put.symbol)
+        await notifier.send(
+            f"<b>⚠️ ENTRY ABORTED — bad put fill</b> [{straddle_id}]\n"
+            f"chase_buy returned a $0 fill price for "
+            f"<code>{pair.put.symbol}</code>. Rolled back both legs; "
+            f"no position taken."
         )
-    else:
-        # ── Fallback: individual leg chasing ──
-        log.warning("rfq_failed_fallback_to_chase", id=straddle_id)
+        return None
+    log.info("put_filled", id=straddle_id, price=put_fill)
 
-        call_result = await exchange.chase_buy(
-            pair.call.symbol, total_qty, pair.call.bid)
-        if call_result is None or call_result.get("order_status") == "partial":
-            log.error("call_buy_failed_or_partial", id=straddle_id,
-                      symbol=pair.call.symbol, partial=bool(call_result))
-            # A partial fill leaves a live long leg — flatten it so we don't
-            # leave an orphan behind a failed entry.
-            await _emergency_flatten(exchange, pair.call.symbol)
-            return None
-
-        call_fill = float(call_result.get("average_price", pair.call.bid))
-        log.info("call_filled", id=straddle_id, price=call_fill)
-
-        call_leg = StraddleLeg(
-            instrument=pair.call.symbol, side="Buy",
-            qty=total_qty, entry_price=call_fill,
-            order_id=call_result.get("order_id", ""),
-            avg_fill_price=call_fill,
-        )
-
-        put_result = await exchange.chase_buy(
-            pair.put.symbol, total_qty, pair.put.bid)
-        if put_result is None or put_result.get("order_status") == "partial":
-            log.error("put_buy_failed_or_partial", id=straddle_id,
-                      symbol=pair.put.symbol, partial=bool(put_result))
-            # Roll back the filled call AND any partial put leg.
-            await _emergency_flatten(exchange, pair.call.symbol)
-            await _emergency_flatten(exchange, pair.put.symbol)
-            return None
-
-        put_fill = float(put_result.get("average_price", pair.put.bid))
-        log.info("put_filled", id=straddle_id, price=put_fill)
-
-        put_leg = StraddleLeg(
-            instrument=pair.put.symbol, side="Buy",
-            qty=total_qty, entry_price=put_fill,
-            order_id=put_result.get("order_id", ""),
-            avg_fill_price=put_fill,
-        )
+    put_leg = StraddleLeg(
+        instrument=pair.put.symbol, side="Buy",
+        qty=total_qty, entry_price=put_fill,
+        order_id=put_result.get("order_id", ""),
+        avg_fill_price=put_fill,
+    )
 
     # ── Register ──
     straddle_cost = config.QTY_PER_LEG * (call_fill + put_fill)
@@ -195,11 +197,10 @@ async def unwind_straddle(
     reason: str = "hard_close",
 ) -> Optional[UnwindResult]:
     """
-    Attempt to close the open straddle. Returns an ``UnwindResult`` (or
-    ``None`` if nothing is open).
+    Attempt to close the open straddle, maker-only. Returns an
+    ``UnwindResult`` (or ``None`` if nothing is open).
 
-    Primary: RFQ sell both legs atomically.
-    Fallback: individual leg chasing.
+    Both legs are sold via the post-only chase (call then put).
 
     IMPORTANT: this function no longer records the close in the portfolio.
     It reports exactly which legs actually SOLD so the caller can reconcile
@@ -212,28 +213,9 @@ async def unwind_straddle(
     if straddle is None:
         return None
 
-    log.info("unwinding", id=straddle.id, reason=reason, method="rfq")
+    log.info("unwinding", id=straddle.id, reason=reason, method="maker_chase")
 
-    # ── Primary: RFQ atomic exit ──
-    rfq_result = await exchange.send_rfq_sell(
-        straddle.call_leg.instrument,
-        straddle.put_leg.instrument,
-        straddle.call_leg.qty,
-    )
-
-    if rfq_result is not None:
-        exit_call_price = rfq_result["call_price"]
-        exit_put_price = rfq_result["put_price"]
-        log.info("rfq_unwind_filled", id=straddle.id,
-                 call_exit=exit_call_price, put_exit=exit_put_price)
-        return UnwindResult(
-            exit_call_price=exit_call_price, exit_put_price=exit_put_price,
-            call_sold=True, put_sold=True, atomic=True,
-        )
-
-    # ── Fallback: individual leg chasing ──
-    log.warning("rfq_sell_failed_fallback_to_chase", id=straddle.id)
-
+    # ── Maker-only exit: chase each leg post-only ──
     call_sold = False
     exit_call_price = straddle.entry_call_price
     _, call_ask = await market.get_option_bid_ask(straddle.call_leg.instrument)
