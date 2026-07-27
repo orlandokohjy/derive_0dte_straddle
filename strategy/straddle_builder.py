@@ -106,6 +106,23 @@ async def build_straddle(
     # ── Maker-only entry: chase each leg post-only (call then put) ──
     call_result = await exchange.chase_buy(
         pair.call.symbol, total_qty, pair.call.bid)
+    if call_result and call_result.get("rejected_insufficient_funds"):
+        # Exchange refused the order for lack of usable margin — nothing
+        # filled, nothing to roll back. Surface the REAL reason (not a
+        # misleading "$0 fill") and skip.
+        err = str(call_result.get("error", "insufficient funds"))
+        log.error("call_buy_insufficient_funds", id=straddle_id,
+                  symbol=pair.call.symbol, error=err)
+        await notifier.send(
+            f"<b>⚠️ ENTRY SKIPPED — insufficient funds</b> [{straddle_id}]\n"
+            f"Derive rejected the call order for "
+            f"<code>{pair.call.symbol}</code>.\n"
+            f"No position taken.\n"
+            f"<i>Usable margin in subaccount is too low — check that "
+            f"collateral is actually deposited &amp; settled.</i>\n"
+            f"<code>{err[:180]}</code>"
+        )
+        return None
     if call_result is None or call_result.get("order_status") == "partial":
         log.error("call_buy_failed_or_partial", id=straddle_id,
                   symbol=pair.call.symbol, partial=bool(call_result))
@@ -137,6 +154,20 @@ async def build_straddle(
 
     put_result = await exchange.chase_buy(
         pair.put.symbol, total_qty, pair.put.bid)
+    if put_result and put_result.get("rejected_insufficient_funds"):
+        # Call already filled — roll it back so we don't sit on a naked long.
+        err = str(put_result.get("error", "insufficient funds"))
+        log.error("put_buy_insufficient_funds", id=straddle_id,
+                  symbol=pair.put.symbol, error=err)
+        await _emergency_flatten(exchange, pair.call.symbol)
+        await notifier.send(
+            f"<b>⚠️ ENTRY ABORTED — insufficient funds on put</b> "
+            f"[{straddle_id}]\n"
+            f"Call filled then Derive rejected the put for lack of margin. "
+            f"Rolled back the call; no position held.\n"
+            f"<code>{err[:180]}</code>"
+        )
+        return None
     if put_result is None or put_result.get("order_status") == "partial":
         log.error("put_buy_failed_or_partial", id=straddle_id,
                   symbol=pair.put.symbol, partial=bool(put_result))
