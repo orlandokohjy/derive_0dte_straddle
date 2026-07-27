@@ -50,11 +50,14 @@ class Scheduler:
             )
 
         report_t = config.REPORT_UTC
+        # Daily report fires every day — the schedule spans weekday AND weekend
+        # sessions, so weekend trades must be reported too.
+        report_days = ",".join(config._WEEKDAY_DOW + config._WEEKEND_DOW)
         self._scheduler.add_job(
             on_report,
             CronTrigger(
                 hour=report_t.hour, minute=report_t.minute,
-                day_of_week=weekdays, timezone=UTC,
+                day_of_week=report_days, timezone=UTC,
             ),
             id="daily_report",
             name=f"Daily Report ({report_t.hour:02d}:{report_t.minute:02d} UTC)",
