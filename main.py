@@ -17,6 +17,7 @@ import re
 import signal
 import sys
 import time as _time
+from typing import Optional
 
 import structlog
 
@@ -177,8 +178,13 @@ class Algo:
         spot = await self.exchange.get_spot_price()
 
         if not config.DRY_RUN:
-            live_equity = await self.exchange.get_subaccount_equity()
-            if live_equity > 0:
+            # None = read failed (keep last known equity); 0.0 = genuinely
+            # empty and MUST be synced, or stale equity fakes the pre-flight.
+            live_equity = await self.exchange.get_subaccount_collateral()
+            if live_equity is None:
+                log.warning("startup_equity_read_failed_keeping_persisted",
+                            persisted=self.portfolio.equity)
+            else:
                 self.portfolio.sync_equity(live_equity)
 
         log.info("algo_initialized",
@@ -481,8 +487,11 @@ class Algo:
             return
 
         if not config.DRY_RUN:
-            live_equity = await self.exchange.get_subaccount_equity()
-            if live_equity > 0:
+            live_equity = await self.exchange.get_subaccount_collateral()
+            if live_equity is None:
+                log.warning("entry_equity_read_failed_keeping_persisted",
+                            persisted=self.portfolio.equity)
+            else:
                 self.portfolio.sync_equity(live_equity)
 
         equity = self.portfolio.equity
@@ -512,12 +521,26 @@ class Algo:
             await notifier.notify_skip(entry_check.reason)
             return
 
-        # ── Pre-entry collateral check ──
+        # ── Pre-entry collateral check (FAILS CLOSED) ──
+        # An unreadable balance and a genuinely EMPTY subaccount must both
+        # block the entry. The old gate was `available > 0 and available <
+        # required`, so a $0 subaccount (which reads 0) skipped the check
+        # entirely and every order then died on 11000 Insufficient funds.
+        live_collateral: Optional[float] = None
         if not config.DRY_RUN:
-            available = await self.exchange.get_subaccount_equity()
+            available = await self.exchange.get_subaccount_collateral()
+            live_collateral = available
             required = sizing.total_capital_required \
                 * config.COLLATERAL_BUFFER_FACTOR
-            if available > 0 and available < required:
+            if available is None:
+                msg = (
+                    "Could not read Derive subaccount collateral — "
+                    "blocking entry (fail-closed). Check API/session key."
+                )
+                log.warning("collateral_check_unavailable", msg=msg)
+                await notifier.notify_skip(msg)
+                return
+            if available < required:
                 msg = (
                     f"Insufficient collateral on Derive subaccount.\n"
                     f"Available: ${available:,.2f}\n"
@@ -543,6 +566,13 @@ class Algo:
             headroom=f"${sizing.available_capital - sizing.total_capital_required:,.2f}",
         )
 
+        # Show the LIVE exchange collateral, not just the equity-derived
+        # allocation — these diverged badly once (stale persisted equity
+        # printed "Available: $5,242" for an empty subaccount).
+        collateral_line = (
+            f"  Live collateral: ${live_collateral:,.2f}\n"
+            if live_collateral is not None else ""
+        )
         await notifier.send(
             f"<b>PRE-FLIGHT CHECK</b>\n"
             f"Straddles: {sizing.num_straddles}\n"
@@ -559,6 +589,7 @@ class Algo:
             f"  Total (w/ 5% buffer): ${sizing.total_capital_required:,.2f}\n"
             f"  Available: ${sizing.available_capital:,.2f}\n"
             f"  Headroom: ${sizing.available_capital - sizing.total_capital_required:,.2f}\n"
+            f"{collateral_line}"
         )
 
         straddle = await build_straddle(
@@ -766,8 +797,11 @@ class Algo:
             await notifier.notify_close(pnl, "session_close")
 
             if not config.DRY_RUN:
-                live_equity = await self.exchange.get_subaccount_equity()
-                if live_equity > 0:
+                live_equity = await self.exchange.get_subaccount_collateral()
+                if live_equity is None:
+                    log.warning("close_equity_read_failed_keeping_persisted",
+                                persisted=self.portfolio.equity)
+                else:
                     self.portfolio.sync_equity(live_equity)
 
             actual_pnl = self.portfolio.equity - equity_before

@@ -185,20 +185,67 @@ class DeriveExchange:
         )
         return instruments if isinstance(instruments, list) else []
 
-    async def get_subaccount_equity(self) -> float:
-        """Get the subaccount's total equity (positions + collateral) in USD."""
+    async def get_subaccount_collateral(self) -> Optional[float]:
+        """Live USABLE collateral (USD) on the active subaccount, or None if
+        the read failed.
+
+        ``collaterals_value`` is authoritative: it is the deposited collateral
+        the margin engine actually lends against, which is what a premium
+        payment draws on. ``subaccount_value`` additionally includes open
+        position mark-to-market, which is NOT spendable — preferring it made
+        an empty subaccount look funded.
+
+        CRITICAL: a genuine 0.0 is a VALID answer (empty subaccount) and is
+        returned as 0.0, NOT None. None means "could not determine". Callers
+        must fail CLOSED on None rather than treating it as "no limit" — an
+        earlier version conflated the two, so an empty subaccount sailed
+        through the pre-entry gate and every order died on
+        ``11000 Insufficient funds``.
+        """
         try:
-            sub = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: self._client.active_subaccount.refresh()
+            sub = self._client.active_subaccount
+            # refresh() mutates the subaccount; don't rely on its return value.
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: sub.refresh()
             )
-            state = sub.state
-            equity = float(getattr(state, "subaccount_value", 0) or 0)
-            collateral = float(getattr(state, "collaterals_value", 0) or 0)
-            log.debug("subaccount_state", equity=equity, collateral=collateral)
-            return equity if equity > 0 else collateral
+            state = getattr(sub, "state", None)
+            if state is None:
+                log.warning("subaccount_state_missing")
+                return None
+
+            collateral = getattr(state, "collaterals_value", None)
+            equity = getattr(state, "subaccount_value", None)
+            details = [
+                (getattr(c, "asset_name", None) or getattr(c, "currency", None),
+                 getattr(c, "amount", None))
+                for c in (getattr(state, "collaterals", None) or [])
+            ]
+            log.info("subaccount_state",
+                     subaccount_id=getattr(state, "subaccount_id", None),
+                     margin_type=str(getattr(state, "margin_type", "")),
+                     collaterals_value=collateral,
+                     subaccount_value=equity,
+                     collaterals=details)
+
+            # `is None` checks — 0.0 is a real, meaningful value here.
+            if collateral is not None:
+                return float(collateral)
+            if equity is not None:
+                return float(equity)
+            log.warning("subaccount_collateral_fields_missing")
+            return None
         except Exception:
-            log.warning("get_equity_failed", exc_info=True)
-            return 0.0
+            log.warning("get_collateral_failed", exc_info=True)
+            return None
+
+    async def get_subaccount_equity(self) -> float:
+        """Back-compat wrapper: live collateral, or 0.0 if unreadable.
+
+        Prefer ``get_subaccount_collateral()`` where the difference between
+        "empty" and "unknown" matters (i.e. any risk gate).
+        """
+        value = await self.get_subaccount_collateral()
+        return 0.0 if value is None else value
 
     # ──────────────────── Order Placement ─────────────────────────
 

@@ -109,10 +109,20 @@ class Portfolio:
         return self._equity
 
     def sync_equity(self, live_equity: float) -> None:
-        """Sync internal equity with the live Derive subaccount balance."""
-        if live_equity <= 0:
+        """Sync internal equity with the live Derive subaccount balance.
+
+        A live 0.0 IS synced: an empty subaccount must collapse equity to 0 so
+        sizing yields zero straddles and the session skips honestly. Refusing
+        to sync 0 is what let a stale persisted $6,553 survive an empty
+        account and print a fictional "Available: $5,242" pre-flight. Only a
+        negative (impossible) value is rejected; callers must not call this at
+        all when the read FAILED (unknown ≠ zero).
+        """
+        if live_equity < 0:
             log.warning("sync_equity_skipped", live_equity=live_equity)
             return
+        if live_equity == 0:
+            log.warning("sync_equity_zero_balance", previous=self._equity)
         old = self._equity
         self._equity = live_equity
         self._save_equity()
