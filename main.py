@@ -592,7 +592,7 @@ class Algo:
             f"{collateral_line}"
         )
 
-        straddle = await build_straddle(
+        straddle, outcome = await build_straddle(
             self.exchange, self.market, self.portfolio, pair, sizing.num_straddles,
         )
         if straddle:
@@ -610,19 +610,31 @@ class Algo:
                 put_cost_total=straddle.entry_put_price * config.QTY_PER_LEG * sizing.num_straddles,
             )
             log.info("session_entry_done", num_straddles=sizing.num_straddles)
+        elif outcome == "skipped":
+            # Market/account condition (wide spread, no usable collateral) —
+            # we chose not to trade. NOT a fault, so it must not feed the
+            # circuit breaker; otherwise a run of illiquid 0DTE sessions
+            # locks the algo for no reason. The builder already alerted.
+            log.info("entry_skipped_not_a_failure", session_outcome=outcome)
         else:
-            log.error("straddle_build_failed")
-            self._register_session_failure("build_straddle returned None")
+            log.error("straddle_build_failed", session_outcome=outcome)
+            self._register_session_failure(f"build_straddle {outcome}")
 
     # ──────────────────── Failure tracking / circuit breaker ─────
 
     def _register_session_failure(self, reason: str) -> None:
-        """Increment failure counter; lock entries if threshold exceeded."""
+        """Increment failure counter; lock entries if threshold exceeded.
+
+        ``CONSECUTIVE_FAILURE_LIMIT <= 0`` DISABLES the breaker (OKX parity):
+        the counter still increments for logging but entries are never locked.
+        """
         self._consecutive_failures += 1
         log.warning("session_failure_recorded",
                     count=self._consecutive_failures,
                     limit=config.CONSECUTIVE_FAILURE_LIMIT, reason=reason)
-        if self._consecutive_failures >= config.CONSECUTIVE_FAILURE_LIMIT:
+        if (config.CONSECUTIVE_FAILURE_LIMIT > 0
+                and self._consecutive_failures
+                >= config.CONSECUTIVE_FAILURE_LIMIT):
             self._entry_locked = True
             self._lock_reason = (
                 f"{self._consecutive_failures} consecutive session failures "

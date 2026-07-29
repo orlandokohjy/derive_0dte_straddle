@@ -64,13 +64,21 @@ async def build_straddle(
     portfolio: Portfolio,
     pair: StraddlePair,
     num_straddles: int,
-) -> Optional[Straddle]:
+) -> tuple[Optional[Straddle], str]:
     """
     Execute the entry for N identical straddle units, maker-only.
 
     Both legs are bought via the post-only chase (call then put). A partial
     or failed leg is rolled back with a position-aware emergency flatten so a
     failed entry never leaves an orphan behind.
+
+    Returns ``(straddle, outcome)`` where outcome is one of:
+      • ``"ok"``      — filled; ``straddle`` is set.
+      • ``"skipped"`` — deliberately did not trade because of a MARKET or
+        ACCOUNT condition (spread too wide, no usable collateral). Nothing is
+        wrong with the algo, so the caller must NOT count this toward the
+        circuit breaker — otherwise a run of illiquid sessions locks the algo.
+      • ``"failed"`` — a genuine fault (leg failed/partial, bogus $0 fill).
     """
     from core import notifier
 
@@ -103,7 +111,7 @@ async def build_straddle(
             f"spread={put_spread:.1%}\n"
             f"Cap: {config.OPTION_MAX_ENTRY_SPREAD_PCT:.0%}\n"
         )
-        return None
+        return None, "skipped"
 
     # ── Maker-only entry: chase each leg post-only (call then put) ──
     call_result = await exchange.chase_buy(
@@ -124,14 +132,14 @@ async def build_straddle(
             f"collateral is actually deposited &amp; settled.</i>\n"
             f"<code>{err[:180]}</code>"
         )
-        return None
+        return None, "skipped"
     if call_result is None or call_result.get("order_status") == "partial":
         log.error("call_buy_failed_or_partial", id=straddle_id,
                   symbol=pair.call.symbol, partial=bool(call_result))
         # A partial fill leaves a live long leg — flatten it so we don't
         # leave an orphan behind a failed entry.
         await _emergency_flatten(exchange, pair.call.symbol)
-        return None
+        return None, "failed"
 
     call_fill = float(call_result.get("average_price", 0) or 0)
     if call_fill <= 0:
@@ -144,7 +152,7 @@ async def build_straddle(
             f"chase_buy returned a $0 fill price for "
             f"<code>{pair.call.symbol}</code>. Rolled back; no position taken."
         )
-        return None
+        return None, "failed"
     log.info("call_filled", id=straddle_id, price=call_fill)
 
     call_leg = StraddleLeg(
@@ -169,14 +177,14 @@ async def build_straddle(
             f"Rolled back the call; no position held.\n"
             f"<code>{err[:180]}</code>"
         )
-        return None
+        return None, "skipped"
     if put_result is None or put_result.get("order_status") == "partial":
         log.error("put_buy_failed_or_partial", id=straddle_id,
                   symbol=pair.put.symbol, partial=bool(put_result))
         # Roll back the filled call AND any partial put leg.
         await _emergency_flatten(exchange, pair.call.symbol)
         await _emergency_flatten(exchange, pair.put.symbol)
-        return None
+        return None, "failed"
 
     put_fill = float(put_result.get("average_price", 0) or 0)
     if put_fill <= 0:
@@ -190,7 +198,7 @@ async def build_straddle(
             f"<code>{pair.put.symbol}</code>. Rolled back both legs; "
             f"no position taken."
         )
-        return None
+        return None, "failed"
     log.info("put_filled", id=straddle_id, price=put_fill)
 
     put_leg = StraddleLeg(
@@ -222,7 +230,7 @@ async def build_straddle(
              cost=f"${straddle_cost * num_straddles:,.2f}",
              call_premium=call_fill, put_premium=put_fill,
              call_strike=pair.call.strike, put_strike=pair.put.strike)
-    return straddle
+    return straddle, "ok"
 
 
 async def unwind_straddle(
