@@ -1,8 +1,9 @@
 """
-Derive 0DTE BTC Pure Straddle Algo.
+Derive 0DTE BTC Long OTM Strangle Algo.
 
 Multi-session schedule mirroring the OKX ATM-wings timing (no wings).
-Position: 1 ATM call + 1 put (nearest strike to spot) per QTY_PER_LEG BTC.
+Position: next OTM call + next OTM put (strikes straddling spot, so they
+DIFFER) per QTY_PER_LEG BTC — a net-debit long-volatility strangle.
 Compound sizing: 80% of current equity, no cap on straddles.
 Maker-only orders with escalating chase on Derive (formerly Lyra); the
 post-close reconcile taker-escalates after CLOSE_FLATTEN_TAKER_AFTER_ROUNDS.
@@ -473,7 +474,10 @@ class Algo:
         spot = await self.exchange.get_spot_price()
         pair = select_straddle_pair(self.chain, spot)
         if pair is None:
-            await notifier.notify_skip(f"No valid ITM call + put pair near spot ${spot:,.0f}")
+            await notifier.notify_skip(
+                f"No valid OTM strangle (next OTM call + next OTM put) "
+                f"near spot ${spot:,.0f}"
+            )
             return
 
         if not config.DRY_RUN:
@@ -542,7 +546,9 @@ class Algo:
         await notifier.send(
             f"<b>PRE-FLIGHT CHECK</b>\n"
             f"Straddles: {sizing.num_straddles}\n"
-            f"Spot: ${spot:,.0f} | Strike: ${pair.strike:,.0f}\n"
+            f"Spot: ${spot:,.0f}\n"
+            f"Strikes: C ${pair.call.strike:,.0f} / P "
+            f"${pair.put.strike:,.0f}  (OTM strangle)\n"
             f"\n<b>Per straddle:</b>\n"
             f"  Call cost ({config.QTY_PER_LEG} BTC): ${sizing.call_cost_per:,.2f}\n"
             f"  Put cost ({config.QTY_PER_LEG} BTC): ${sizing.put_cost_per:,.2f}\n"
@@ -565,7 +571,8 @@ class Algo:
                 num_straddles=sizing.num_straddles,
                 equity=equity,
                 straddle_cost=sizing.straddle_cost,
-                strike=pair.strike,
+                strike=pair.call.strike,
+                put_strike=pair.put.strike,
                 call_fill=straddle.entry_call_price,
                 put_fill=straddle.entry_put_price,
                 call_cost_total=straddle.entry_call_price * config.QTY_PER_LEG * sizing.num_straddles,

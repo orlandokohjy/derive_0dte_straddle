@@ -55,6 +55,10 @@ class Straddle:
     straddle_cost: float
     num_straddles: int
 
+    # OTM strangle: the legs sit at DIFFERENT strikes. ``strike`` holds the
+    # CALL strike (legacy single-strike field); ``put_strike`` the put's.
+    # 0.0 means "same as strike" (a legacy same-strike straddle).
+    put_strike: float = 0.0
     status: str = "open"
     exit_time: Optional[str] = None
     exit_call_price: Optional[float] = None
@@ -76,6 +80,7 @@ class Straddle:
             "call_leg": self.call_leg.to_dict(),
             "put_leg": self.put_leg.to_dict(),
             "strike": self.strike,
+            "put_strike": self.put_strike or self.strike,
             "qty_per_leg": self.qty_per_leg,
             "entry_time": self.entry_time,
             "entry_call_price": self.entry_call_price,

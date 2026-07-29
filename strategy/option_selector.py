@@ -1,12 +1,14 @@
 """
-Select the ATM strike (call + put) for the pure straddle.
+Select the LONG OTM STRANGLE (call + put at different strikes).
 
-Strategy (parity with the OKX ATM-wings stack): pick the listed strike
-CLOSEST to spot (|strike − spot| minimised, either side of spot) that has
-BOTH a tradable call and put, and use that strike for both legs. This
-creates a balanced ATM straddle. (The legacy Derive selector always
-rounded DOWN to an ITM call, giving a long-delta bias — changed to match
-OKX ATM selection 2026-07-25.)
+Strategy (parity with the OKX `okx_strangle_btc` stack): buy the next OTM
+call (nearest listed strike strictly ABOVE spot with a tradable ask) and the
+next OTM put (nearest listed strike strictly BELOW spot with a tradable ask).
+Net debit, long volatility, no short legs.
+
+History: the original selector rounded DOWN to an ITM call (long-delta bias);
+2026-07-25 it moved to true-ATM (same strike both legs); 2026-07-29 it became
+this OTM strangle to match the OKX strangle stacks.
 """
 from __future__ import annotations
 
@@ -24,6 +26,9 @@ log = structlog.get_logger(__name__)
 class StraddlePair:
     call: OptionInfo
     put: OptionInfo
+    # CALL strike, kept as ``strike`` for compatibility with legacy
+    # single-strike call sites. The authoritative per-leg strikes are
+    # ``call.strike`` and ``put.strike`` (they DIFFER on a strangle).
     strike: float
 
 
@@ -40,13 +45,16 @@ def _spread_pct(bid: float, ask: float, mark: float = 0.0) -> float:
 
 def select_straddle_pair(chain: OptionChain, spot: float) -> Optional[StraddlePair]:
     """
-    Find the strike CLOSEST to spot (true ATM) and its call+put.
+    Find the LONG OTM strangle: next OTM call + next OTM put.
 
-    We pick the listed strike with the smallest |strike − spot| that has
-    BOTH a call and a put with a valid ask (we're buying, so ask > 0 is the
-    relevant liquidity check; bid may be 0 on a thin book). The nearest
-    strike can be ABOVE spot (slightly-OTM call / ITM put) or below. Same
-    strike is used for both legs → a balanced ATM straddle.
+    - Call leg: nearest listed strike strictly ABOVE spot with a tradable ask
+      (we're buying, so ask > 0 is the liquidity check; bid may be 0 on a thin
+      book). This is the first OTM call.
+    - Put leg:  nearest listed strike strictly BELOW spot with a tradable ask.
+      This is the first OTM put.
+
+    The two legs have DIFFERENT strikes (they straddle spot). Returns None if
+    either side has no tradable OTM strike.
     """
     calls_by_strike: dict[float, OptionInfo] = {}
     for c in chain.calls:
@@ -57,25 +65,24 @@ def select_straddle_pair(chain: OptionChain, spot: float) -> Optional[StraddlePa
         if p.ask > 0 and p.strike not in puts_by_strike:
             puts_by_strike[p.strike] = p
 
-    common = sorted(set(calls_by_strike) & set(puts_by_strike))
-    if not common:
-        log.warning("no_tradable_common_strike", spot=spot,
-                    call_strikes=sorted(calls_by_strike)[:10],
-                    put_strikes=sorted(puts_by_strike)[:10])
+    calls_above = sorted(s for s in calls_by_strike if s > spot)
+    puts_below = sorted((s for s in puts_by_strike if s < spot), reverse=True)
+    if not calls_above or not puts_below:
+        log.warning("no_otm_strangle", spot=spot,
+                    calls_above=calls_above[:5],
+                    puts_below=puts_below[:5])
         return None
 
-    # Nearest strike to spot; ties (spot exactly at a midpoint) break to the
-    # LOWER strike via the (distance, strike) sort key.
-    strike = min(common, key=lambda s: (abs(s - spot), s))
-    best_call = calls_by_strike[strike]
-    matching_put = puts_by_strike[strike]
+    best_call = calls_by_strike[calls_above[0]]   # nearest strike above spot
+    matching_put = puts_by_strike[puts_below[0]]  # nearest strike below spot
 
     spread_call = _spread_pct(best_call.bid, best_call.ask, best_call.mark)
     spread_put = _spread_pct(matching_put.bid, matching_put.ask,
                              matching_put.mark)
 
-    log.info("straddle_pair_selected",
-             strike=best_call.strike,
+    log.info("otm_strangle_selected",
+             call_strike=best_call.strike,
+             put_strike=matching_put.strike,
              call_bid=best_call.bid, call_ask=best_call.ask,
              call_mark=best_call.mark, call_spread=f"{spread_call:.1f}%",
              put_bid=matching_put.bid, put_ask=matching_put.ask,

@@ -77,7 +77,8 @@ async def build_straddle(
     straddle_id = f"D0-{uuid.uuid4().hex[:8]}"
     total_qty = config.QTY_PER_LEG * num_straddles
 
-    log.info("building_straddle", id=straddle_id, strike=pair.strike,
+    log.info("building_straddle", id=straddle_id,
+             call_strike=pair.call.strike, put_strike=pair.put.strike,
              call=pair.call.symbol, put=pair.put.symbol, num=num_straddles,
              method="maker_chase")
 
@@ -94,7 +95,8 @@ async def build_straddle(
         log.warning("spread_gate_skip", id=straddle_id, msg=msg)
         await notifier.send(
             f"<b>ENTRY SKIPPED — wide spread</b> [{straddle_id}]\n"
-            f"Strike: ${pair.strike:,.0f}\n"
+            f"Strikes: C ${pair.call.strike:,.0f} / P "
+            f"${pair.put.strike:,.0f}\n"
             f"  Call:  bid=${pair.call.bid:,.2f}  ask=${pair.call.ask:,.2f}  "
             f"spread={call_spread:.1%}\n"
             f"  Put:   bid=${pair.put.bid:,.2f}  ask=${pair.put.ask:,.2f}  "
@@ -205,7 +207,8 @@ async def build_straddle(
         id=straddle_id,
         call_leg=call_leg,
         put_leg=put_leg,
-        strike=pair.strike,
+        strike=pair.call.strike,
+        put_strike=pair.put.strike,
         qty_per_leg=config.QTY_PER_LEG,
         entry_time=now_utc().isoformat(),
         entry_call_price=call_fill,
@@ -217,7 +220,8 @@ async def build_straddle(
     portfolio.set_straddle(straddle)
     log.info("straddle_built", id=straddle_id, num=num_straddles,
              cost=f"${straddle_cost * num_straddles:,.2f}",
-             call_premium=call_fill, put_premium=put_fill, strike=pair.strike)
+             call_premium=call_fill, put_premium=put_fill,
+             call_strike=pair.call.strike, put_strike=pair.put.strike)
     return straddle
 
 

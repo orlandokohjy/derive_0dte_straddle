@@ -49,13 +49,24 @@ async def notify_entry(
     num_straddles: int, equity: float, straddle_cost: float,
     strike: float, call_fill: float, put_fill: float,
     call_cost_total: float, put_cost_total: float,
+    put_strike: float = 0.0,
 ) -> None:
+    """``strike`` is the OTM CALL strike; ``put_strike`` the OTM put strike.
+    On a strangle they differ and both are shown; a legacy same-strike
+    straddle (put_strike 0 or equal) shows a single line."""
+    if put_strike > 0 and abs(put_strike - strike) > 1e-9:
+        strike_lines = (
+            f"Call strike (OTM): ${strike:,.0f}\n"
+            f"Put strike (OTM):  ${put_strike:,.0f}\n"
+        )
+    else:
+        strike_lines = f"Strike: ${strike:,.0f}\n"
     await send(
         f"<b>SESSION ENTRY</b>\n"
         f"Straddles: {num_straddles}\n"
         f"Equity: ${equity:,.2f}\n"
         f"\n<b>Fills</b>\n"
-        f"Strike: ${strike:,.0f}\n"
+        f"{strike_lines}"
         f"Call premium: ${call_fill:,.2f}\n"
         f"Put premium: ${put_fill:,.2f}\n"
         f"\n<b>Capital used</b>\n"
