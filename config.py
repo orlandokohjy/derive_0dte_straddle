@@ -158,7 +158,10 @@ ALLOWED_WEEKDAYS: set[int] = {0, 1, 2, 3, 4}  # Mon–Fri (legacy)
 # ──────────────────── Execution Settings ──────────────────────────
 OPTION_CHASE_INTERVAL_SEC: float = 5.0
 OPTION_CHASE_MAX_ATTEMPTS: int = 60
-OPTION_TICK_SIZE: float = 5.0
+# Price grid the chase snaps to. $5 is coarse for a 0DTE BTC option quoted
+# near $200 (a 2.5 % step), which blunts the gap-narrowing chase — override
+# it once Derive's per-instrument `tick_size` is confirmed.
+OPTION_TICK_SIZE: float = float(os.getenv("OPTION_TICK_SIZE", "5.0"))
 
 # Chase logic: on each retry narrow the gap to the ask/bid by this pct
 OPTION_CHASE_GAP_NARROW_PCT: float = float(os.getenv("OPTION_CHASE_GAP_NARROW_PCT", "0.5"))

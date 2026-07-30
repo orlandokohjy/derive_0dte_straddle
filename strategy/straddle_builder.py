@@ -51,6 +51,53 @@ class UnwindResult:
         return self.atomic or (self.call_sold and self.put_sold)
 
 
+def _no_fill_alert(
+    straddle_id: str,
+    leg: str,
+    symbol: str,
+    result: Optional[dict],
+    rolled_back_call: Optional[str] = None,
+) -> str:
+    """Telegram text for a leg that failed or only partially filled.
+
+    This path used to return ``"failed"`` with only a log line, so a chase
+    that expired without filling produced ZERO notifications — the session
+    just went quiet after PRE-FLIGHT and no SESSION CLOSE followed either
+    (nothing was registered to unwind). Every exit from build_straddle must
+    alert.
+    """
+    partial = bool(result) and result.get("order_status") == "partial"
+    if partial:
+        filled = result.get("filled_amount", "?")
+        remaining = result.get("remaining_amount", "?")
+        detail = (
+            f"Only <b>partially</b> filled: {filled} BTC done, "
+            f"{remaining} BTC left after the "
+            f"{config.OPTION_CHASE_DEADLINE_MIN:.0f}-min chase."
+        )
+    else:
+        detail = (
+            f"No fill at all within the "
+            f"{config.OPTION_CHASE_DEADLINE_MIN:.0f}-min post-only chase "
+            f"(book never crossed our bid, or the "
+            f"{config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR:.2f}× mark cap "
+            f"kept us too far back)."
+        )
+    rollback = (
+        f"Rolled back the already-filled call "
+        f"<code>{rolled_back_call}</code>.\n"
+        if rolled_back_call else ""
+    )
+    return (
+        f"<b>⚠️ ENTRY FAILED — {leg} not filled</b> [{straddle_id}]\n"
+        f"<code>{symbol}</code>\n"
+        f"{detail}\n"
+        f"{rollback}"
+        f"Position rolled back — <b>nothing is held</b>. No trade this "
+        f"session."
+    )
+
+
 def _spread_pct(bid: float, ask: float) -> float:
     if bid <= 0 or ask <= 0:
         return 1.0
@@ -139,6 +186,8 @@ async def build_straddle(
         # A partial fill leaves a live long leg — flatten it so we don't
         # leave an orphan behind a failed entry.
         await _emergency_flatten(exchange, pair.call.symbol)
+        await notifier.send(_no_fill_alert(
+            straddle_id, "call", pair.call.symbol, call_result))
         return None, "failed"
 
     call_fill = float(call_result.get("average_price", 0) or 0)
@@ -184,6 +233,9 @@ async def build_straddle(
         # Roll back the filled call AND any partial put leg.
         await _emergency_flatten(exchange, pair.call.symbol)
         await _emergency_flatten(exchange, pair.put.symbol)
+        await notifier.send(_no_fill_alert(
+            straddle_id, "put", pair.put.symbol, put_result,
+            rolled_back_call=pair.call.symbol))
         return None, "failed"
 
     put_fill = float(put_result.get("average_price", 0) or 0)

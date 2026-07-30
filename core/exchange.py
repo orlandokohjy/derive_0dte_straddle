@@ -42,6 +42,15 @@ def _is_insufficient_funds(err_str: str) -> bool:
     return any(token in upper for token in INSUFFICIENT_FUNDS_TOKENS)
 
 
+# Tolerance for cap/floor comparisons — mark * 1.15 and mark / 1.15 land on
+# unrepresentable binaries, so an exact `>` / `<` misjudges an on-grid price.
+_EPS = 1e-6
+
+# Give up the chase after this many CONSECUTIVE attempts blocked by the
+# slippage cap/floor instead of silently burning the whole deadline.
+_CAP_BLOCK_ABORT_ATTEMPTS = 12
+
+
 def _round_price(price: float, direction: str = "down") -> float:
     """Round option price to tick size."""
     tick = config.OPTION_TICK_SIZE
@@ -507,6 +516,7 @@ class DeriveExchange:
         current_price = _round_price(
             initial_bid if initial_bid > 0 else tick, "down")
         attempt = 0
+        cap_blocked = 0
 
         while _time.time() < deadline and remaining_qty > 0:
             attempt += 1
@@ -527,17 +537,31 @@ class DeriveExchange:
                 candidate = current_price + gap * config.OPTION_CHASE_GAP_NARROW_PCT
                 candidate = max(candidate, current_price + tick)
 
-            price = _round_price(min(candidate, hard_cap), "up")
+            # Round DOWN onto the tick grid: a buy must never be rounded up
+            # past its own cap. Rounding up here used to produce e.g.
+            # cap=250.7 -> price=255, which the guard below then rejected on
+            # every single attempt — the chase burned its whole deadline
+            # without ever placing an order.
+            price = _round_price(min(candidate, hard_cap), "down")
             if price < tick:
                 price = tick
 
-            if price > slip_cap:
+            # _EPS absorbs binary float error (mark=200 -> 200*1.15 =
+            # 229.999...97, which a bare `>` treats as breaching a 230.0 cap).
+            if price > slip_cap + _EPS:
+                cap_blocked += 1
                 log.warning("chase_buy_cap_reached", instrument=instrument,
                             price=price, slip_cap=slip_cap, mark=mark,
-                            attempt=attempt,
+                            attempt=attempt, cap_blocked=cap_blocked,
                             remaining_qty=remaining_qty)
+                if cap_blocked >= _CAP_BLOCK_ABORT_ATTEMPTS:
+                    log.error("chase_buy_cap_deadlock", instrument=instrument,
+                              price=price, slip_cap=slip_cap, mark=mark,
+                              attempts=attempt, cap_blocked=cap_blocked)
+                    break
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
+            cap_blocked = 0
 
             current_price = price
 
@@ -672,6 +696,7 @@ class DeriveExchange:
         current_price = _round_price(
             initial_ask if initial_ask > 0 else tick, "up")
         attempt = 0
+        floor_blocked = 0
 
         while _time.time() < deadline and remaining_qty > 0:
             attempt += 1
@@ -692,16 +717,29 @@ class DeriveExchange:
                 candidate = current_price - gap * config.OPTION_CHASE_GAP_NARROW_PCT
                 candidate = min(candidate, current_price - tick)
 
-            price = _round_price(max(candidate, hard_floor), "down")
+            # Round UP onto the tick grid: a sell must never be rounded down
+            # below its own floor, or the guard below rejects every attempt and
+            # the exit chase deadlocks without placing an order (the mirror of
+            # the chase_buy cap deadlock).
+            price = _round_price(max(candidate, hard_floor), "up")
             if price < tick:
                 price = tick
 
-            if price < slip_floor:
+            if price < slip_floor - _EPS:
+                floor_blocked += 1
                 log.warning("chase_sell_floor_reached", instrument=instrument,
                             price=price, slip_floor=slip_floor, mark=mark,
-                            attempt=attempt, remaining_qty=remaining_qty)
+                            attempt=attempt, floor_blocked=floor_blocked,
+                            remaining_qty=remaining_qty)
+                if floor_blocked >= _CAP_BLOCK_ABORT_ATTEMPTS:
+                    log.error("chase_sell_floor_deadlock",
+                              instrument=instrument, price=price,
+                              slip_floor=slip_floor, mark=mark,
+                              attempts=attempt, floor_blocked=floor_blocked)
+                    break
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
+            floor_blocked = 0
 
             current_price = price
 
