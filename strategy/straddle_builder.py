@@ -20,7 +20,7 @@ from typing import Optional
 import structlog
 
 import config
-from core.exchange import DeriveExchange
+from core.exchange import _PLACE_ERROR_ABORT_ATTEMPTS, DeriveExchange
 from core.portfolio import Portfolio, Straddle, StraddleLeg
 from data.market_data import MarketData
 from strategy.option_selector import StraddlePair
@@ -95,6 +95,35 @@ def _no_fill_alert(
         f"{rollback}"
         f"Position rolled back — <b>nothing is held</b>. No trade this "
         f"session."
+    )
+
+
+def _rejected_alert(
+    straddle_id: str,
+    leg: str,
+    symbol: str,
+    error: str,
+    rolled_back_call: Optional[str] = None,
+) -> str:
+    """Telegram text for an order Derive refused outright.
+
+    Distinct from a no-fill: the book is irrelevant here, the exchange would
+    not accept our order at all. Surfacing the raw error matters because this
+    used to masquerade as "chase deadline, no fill" after a single attempt.
+    """
+    rollback = (
+        f"Rolled back the already-filled call "
+        f"<code>{rolled_back_call}</code>.\n"
+        if rolled_back_call else ""
+    )
+    return (
+        f"<b>⚠️ ENTRY FAILED — {leg} order REJECTED</b> [{straddle_id}]\n"
+        f"<code>{symbol}</code>\n"
+        f"Derive refused the order (retried "
+        f"{_PLACE_ERROR_ABORT_ATTEMPTS}×, not a funds or post-only issue):\n"
+        f"<code>{error[:300]}</code>\n"
+        f"{rollback}"
+        f"<b>Nothing is held.</b> This is a defect, not a market condition."
     )
 
 
@@ -183,6 +212,14 @@ async def build_straddle(
             f"<code>{err[:180]}</code>"
         )
         return None, "skipped"
+    if call_result and call_result.get("rejected_by_exchange"):
+        err = str(call_result.get("error", "rejected"))
+        log.error("call_buy_rejected_by_exchange", id=straddle_id,
+                  symbol=pair.call.symbol, error=err)
+        await _emergency_flatten(exchange, pair.call.symbol)
+        await notifier.send(_rejected_alert(
+            straddle_id, "call", pair.call.symbol, err))
+        return None, "failed"
     if call_result is None or call_result.get("order_status") == "partial":
         partial = bool(call_result)
         log.error("call_buy_failed_or_partial", id=straddle_id,
@@ -235,6 +272,16 @@ async def build_straddle(
             f"<code>{err[:180]}</code>"
         )
         return None, "skipped"
+    if put_result and put_result.get("rejected_by_exchange"):
+        err = str(put_result.get("error", "rejected"))
+        log.error("put_buy_rejected_by_exchange", id=straddle_id,
+                  symbol=pair.put.symbol, error=err)
+        await _emergency_flatten(exchange, pair.call.symbol)
+        await _emergency_flatten(exchange, pair.put.symbol)
+        await notifier.send(_rejected_alert(
+            straddle_id, "put", pair.put.symbol, err,
+            rolled_back_call=pair.call.symbol))
+        return None, "failed"
     if put_result is None or put_result.get("order_status") == "partial":
         partial = bool(put_result)
         log.error("put_buy_failed_or_partial", id=straddle_id,

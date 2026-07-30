@@ -50,6 +50,11 @@ _EPS = 1e-6
 # slippage cap/floor instead of silently burning the whole deadline.
 _CAP_BLOCK_ABORT_ATTEMPTS = 12
 
+# Give up after this many CONSECUTIVE exchange rejections of the order itself
+# (not funds, not post-only). Retrying absorbs transient errors; a persistent
+# rejection is a real defect and must surface fast with its error string.
+_PLACE_ERROR_ABORT_ATTEMPTS = 6
+
 
 def _round_price(price: float, direction: str = "down") -> float:
     """Round option price to tick size."""
@@ -517,6 +522,8 @@ class DeriveExchange:
             initial_bid if initial_bid > 0 else tick, "down")
         attempt = 0
         cap_blocked = 0
+        place_errors = 0
+        last_place_error = ""
 
         while _time.time() < deadline and remaining_qty > 0:
             attempt += 1
@@ -584,7 +591,31 @@ class DeriveExchange:
                 continue
             order_id = result.get("order_id", "")
             if not order_id:
-                break
+                # The exchange rejected the order for something other than
+                # funds or post-only (see order_failed for the reason). This
+                # used to `break` on the FIRST rejection, abandoning a 10-min
+                # chase after one attempt and ~2 s, then reporting it as
+                # "deadline_no_fill" as though the book had simply not moved.
+                # Rejections can be transient, so retry — but do not spin.
+                place_errors += 1
+                last_place_error = str(result.get("error", "")) or "rejected"
+                log.warning("chase_buy_order_rejected", instrument=instrument,
+                            price=price, attempt=attempt,
+                            consecutive_rejects=place_errors,
+                            error=last_place_error[:200])
+                if place_errors >= _PLACE_ERROR_ABORT_ATTEMPTS:
+                    log.error("chase_buy_rejected_abort", instrument=instrument,
+                              attempts=attempt, consecutive_rejects=place_errors,
+                              error=last_place_error[:300])
+                    return {"rejected_by_exchange": True,
+                            "error": last_place_error,
+                            "filled_amount": str(total_filled),
+                            "remaining_amount": str(remaining_qty),
+                            "average_price": str(weighted_cost / total_filled)
+                                             if total_filled > 0 else "0"}
+                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                continue
+            place_errors = 0
 
             if result.get("order_status") == "filled":
                 fill_price = float(result.get("average_price", price))
@@ -697,6 +728,8 @@ class DeriveExchange:
             initial_ask if initial_ask > 0 else tick, "up")
         attempt = 0
         floor_blocked = 0
+        place_errors = 0
+        last_place_error = ""
 
         while _time.time() < deadline and remaining_qty > 0:
             attempt += 1
@@ -762,7 +795,28 @@ class DeriveExchange:
                 continue
             order_id = result.get("order_id", "")
             if not order_id:
-                break
+                # Retry rather than abandon: giving up on the first rejection
+                # here leaves a LIVE position we were trying to close.
+                place_errors += 1
+                last_place_error = str(result.get("error", "")) or "rejected"
+                log.warning("chase_sell_order_rejected", instrument=instrument,
+                            price=price, attempt=attempt,
+                            consecutive_rejects=place_errors,
+                            error=last_place_error[:200])
+                if place_errors >= _PLACE_ERROR_ABORT_ATTEMPTS:
+                    log.error("chase_sell_rejected_abort",
+                              instrument=instrument, attempts=attempt,
+                              consecutive_rejects=place_errors,
+                              error=last_place_error[:300])
+                    return {"rejected_by_exchange": True,
+                            "error": last_place_error,
+                            "filled_amount": str(total_filled),
+                            "remaining_amount": str(remaining_qty),
+                            "average_price": str(weighted_revenue / total_filled)
+                                             if total_filled > 0 else "0"}
+                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                continue
+            place_errors = 0
 
             if result.get("order_status") == "filled":
                 fill_price = float(result.get("average_price", price))

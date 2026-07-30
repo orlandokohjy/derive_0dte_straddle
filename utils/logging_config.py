@@ -10,15 +10,50 @@ import structlog
 import config
 
 
+class _Tee:
+    """Fan writes out to several streams.
+
+    structlog's ``PrintLoggerFactory`` writes straight to a stream and never
+    touches the stdlib handlers configured below, so the ``FileHandler`` here
+    was dead: ``logs/algo.log`` stayed empty and every structured event lived
+    only in the container's stdout. A ``docker-compose up --force-recreate``
+    then destroyed the whole trail — which is exactly how we lost the
+    ``order_failed`` error strings for the 2026-07-30 no-fill sessions.
+    Teeing keeps `docker logs` working AND persists to the mounted volume.
+    """
+
+    def __init__(self, *streams) -> None:
+        self._streams = streams
+
+    def write(self, data: str) -> None:
+        for s in self._streams:
+            try:
+                s.write(data)
+            except Exception:  # never let logging kill the algo
+                pass
+
+    def flush(self) -> None:
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+
 def setup_logging() -> None:
-    os.makedirs(os.path.dirname(config.LOG_FILE), exist_ok=True)
+    log_dir = os.path.dirname(config.LOG_FILE)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    # line-buffered so a crash or `docker kill` cannot lose the tail
+    log_fh = open(config.LOG_FILE, "a", buffering=1, encoding="utf-8")
 
     logging.basicConfig(
         level=getattr(logging, config.LOG_LEVEL, logging.INFO),
         format="%(message)s",
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler(config.LOG_FILE),
+            logging.StreamHandler(log_fh),
         ],
     )
 
@@ -41,6 +76,7 @@ def setup_logging() -> None:
             getattr(logging, config.LOG_LEVEL, logging.INFO)
         ),
         context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(),
+        logger_factory=structlog.PrintLoggerFactory(
+            file=_Tee(sys.stdout, log_fh)),
         cache_logger_on_first_use=True,
     )
