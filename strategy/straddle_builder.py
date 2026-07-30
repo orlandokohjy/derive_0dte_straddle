@@ -128,10 +128,31 @@ def _rejected_alert(
 
 
 def _spread_pct(bid: float, ask: float) -> float:
+    """Relative spread, or 1.0 (100 %) when either side is missing.
+
+    That 1.0 sentinel is why ``_missing_quote_legs`` exists: it happens to be
+    caught by a tight percentage gate, but a loosened one waves it straight
+    through. Never rely on this to reject an absent quote.
+    """
     if bid <= 0 or ask <= 0:
         return 1.0
     mid = (bid + ask) / 2.0
     return (ask - bid) / mid if mid > 0 else 1.0
+
+
+def _missing_quote_legs(pair: StraddlePair) -> list[str]:
+    """Legs without a live TWO-SIDED market, independent of the spread cap.
+
+    A leg with no bid is un-exitable: we could buy it and then have nothing to
+    sell into, holding to expiry. The spread gate cannot be trusted to catch
+    this because an absent quote scores a fixed 100 %, so any cap above 1.0
+    (e.g. OPTION_MAX_ENTRY_SPREAD_PCT=3.0) admits it.
+    """
+    return [
+        f"{name} bid=${opt.bid:,.2f} ask=${opt.ask:,.2f}"
+        for name, opt in (("call", pair.call), ("put", pair.put))
+        if opt.bid <= 0 or opt.ask <= 0
+    ]
 
 
 async def build_straddle(
@@ -168,6 +189,24 @@ async def build_straddle(
              call_strike=pair.call.strike, put_strike=pair.put.strike,
              call=pair.call.symbol, put=pair.put.symbol, num=num_straddles,
              method="maker_chase")
+
+    # ── Two-sided quote gate (NOT subject to the spread cap) ──
+    # Must run before the percentage gate: an absent quote scores a flat 100 %,
+    # so any OPTION_MAX_ENTRY_SPREAD_PCT above 1.0 would let it through and we
+    # would buy a leg with no bid to exit into.
+    missing = _missing_quote_legs(pair)
+    if missing:
+        msg = "No two-sided market — " + "; ".join(missing)
+        log.warning("missing_quote_skip", id=straddle_id, msg=msg)
+        await notifier.send(
+            f"<b>ENTRY SKIPPED — no two-sided market</b> [{straddle_id}]\n"
+            f"Strikes: C ${pair.call.strike:,.0f} / P "
+            f"${pair.put.strike:,.0f}\n"
+            + "".join(f"  {m}\n" for m in missing)
+            + f"<i>A leg with no bid cannot be exited — refusing regardless "
+              f"of the {config.OPTION_MAX_ENTRY_SPREAD_PCT:.0%} spread cap.</i>"
+        )
+        return None, "skipped"
 
     # ── Pre-entry spread gate ──
     call_spread = _spread_pct(pair.call.bid, pair.call.ask)
