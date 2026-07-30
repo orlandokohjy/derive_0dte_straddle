@@ -122,10 +122,13 @@ async def build_straddle(
     Returns ``(straddle, outcome)`` where outcome is one of:
       • ``"ok"``      — filled; ``straddle`` is set.
       • ``"skipped"`` — deliberately did not trade because of a MARKET or
-        ACCOUNT condition (spread too wide, no usable collateral). Nothing is
-        wrong with the algo, so the caller must NOT count this toward the
-        circuit breaker — otherwise a run of illiquid sessions locks the algo.
-      • ``"failed"`` — a genuine fault (leg failed/partial, bogus $0 fill).
+        ACCOUNT condition (spread too wide, no usable collateral, or a
+        post-only chase that expired with NOTHING filled because the book
+        never crossed us). Nothing is wrong with the algo, so the caller must
+        NOT count this toward the circuit breaker — otherwise a run of
+        illiquid sessions locks the algo.
+      • ``"failed"`` — a genuine fault: a PARTIAL fill that forced us to
+        unwind a live leg, or a bogus $0 fill price.
     """
     from core import notifier
 
@@ -181,14 +184,19 @@ async def build_straddle(
         )
         return None, "skipped"
     if call_result is None or call_result.get("order_status") == "partial":
+        partial = bool(call_result)
         log.error("call_buy_failed_or_partial", id=straddle_id,
-                  symbol=pair.call.symbol, partial=bool(call_result))
+                  symbol=pair.call.symbol, partial=partial)
         # A partial fill leaves a live long leg — flatten it so we don't
         # leave an orphan behind a failed entry.
         await _emergency_flatten(exchange, pair.call.symbol)
         await notifier.send(_no_fill_alert(
             straddle_id, "call", pair.call.symbol, call_result))
-        return None, "failed"
+        # A post-only chase that expired with NOTHING filled is a market
+        # condition (nobody crossed our bid) — same class as a wide spread,
+        # so it must not feed the circuit breaker. Only a PARTIAL fill, which
+        # means we had to unwind a live leg, counts as a genuine fault.
+        return None, ("failed" if partial else "skipped")
 
     call_fill = float(call_result.get("average_price", 0) or 0)
     if call_fill <= 0:
@@ -228,15 +236,16 @@ async def build_straddle(
         )
         return None, "skipped"
     if put_result is None or put_result.get("order_status") == "partial":
+        partial = bool(put_result)
         log.error("put_buy_failed_or_partial", id=straddle_id,
-                  symbol=pair.put.symbol, partial=bool(put_result))
+                  symbol=pair.put.symbol, partial=partial)
         # Roll back the filled call AND any partial put leg.
         await _emergency_flatten(exchange, pair.call.symbol)
         await _emergency_flatten(exchange, pair.put.symbol)
         await notifier.send(_no_fill_alert(
             straddle_id, "put", pair.put.symbol, put_result,
             rolled_back_call=pair.call.symbol))
-        return None, "failed"
+        return None, ("failed" if partial else "skipped")
 
     put_fill = float(put_result.get("average_price", 0) or 0)
     if put_fill <= 0:
