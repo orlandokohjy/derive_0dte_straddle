@@ -193,6 +193,21 @@ CONSECUTIVE_FAILURE_LIMIT: int = int(
     os.getenv("CONSECUTIVE_FAILURE_LIMIT", "3")
 )
 
+# ─────────────── Self-healing entry lock (orphan auto-release) ────────
+# A POSITION/orphan entry-lock (post-close residual, startup or pre-entry
+# "exchange not flat") used to stay latched until an operator ran
+# force_liquidate + restarted — and since the startup reconcile RE-LOCKS while
+# the residual exists, a restart alone could not clear it either. A worthless
+# 0DTE leg with no bid therefore bricked the algo until it expired AND someone
+# restarted. With this flag on, the entry gate re-verifies the exchange before
+# skipping a locked session: if it is now genuinely flat, the orphan lock
+# releases itself and trading resumes. ONLY orphan/position locks are eligible;
+# kill-switch locks (config/self-test/API/stale-state/circuit-breaker) NEVER
+# auto-clear. Set false to restore the old always-manual behaviour.
+SELF_HEAL_LOCK_ON_FLAT: bool = os.getenv(
+    "SELF_HEAL_LOCK_ON_FLAT", "true",
+).strip().lower() in ("1", "true", "yes")
+
 # ──────────────────── OKX-parity reliability hardening ────────────
 # Persistent post-close re-flatten: after the unwind, if the exchange is
 # NOT flat we loop selling the residual long legs until either the account

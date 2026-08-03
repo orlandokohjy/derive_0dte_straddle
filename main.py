@@ -143,6 +143,10 @@ class Algo:
         # local state, or by the consecutive-failure circuit breaker.
         self._entry_locked: bool = False
         self._lock_reason: str = ""
+        # True only for POSITION/orphan locks that may auto-release once the
+        # exchange is confirmed flat (see _set_entry_lock /
+        # _maybe_release_orphan_lock). Kill-switch locks leave this False.
+        self._lock_clearable_when_flat: bool = False
         self._consecutive_failures: int = 0
 
     async def start(self) -> None:
@@ -238,6 +242,68 @@ class Algo:
         log.info("algo_running")
         await self._shutdown.wait()
 
+    # ──────────────────── Entry lock ──────────────────────────────
+
+    def _set_entry_lock(
+        self, reason: str, *, clearable_when_flat: bool = False,
+    ) -> None:
+        """Engage the entry lock, recording whether it may auto-release.
+
+        ``clearable_when_flat=True`` marks a POSITION/orphan lock (startup
+        reconcile, pre-entry "exchange not flat", post-close residual) that
+        becomes moot the instant the exchange is genuinely flat — e.g. a
+        worthless 0DTE leg settling at expiry. Kill-switch locks (config /
+        self-test / API / stale-state / circuit-breaker) pass False so ONLY an
+        operator restart clears them. Centralising this ensures a later stacked
+        lock can never inherit a stale clearable flag from an earlier one.
+        """
+        self._entry_locked = True
+        self._lock_reason = reason
+        self._lock_clearable_when_flat = clearable_when_flat
+
+    async def _maybe_release_orphan_lock(self) -> bool:
+        """Auto-release an orphan/position entry-lock once the exchange is
+        confirmed flat. Returns True when released (entry may proceed), False
+        when the caller must keep blocking.
+
+        Fail-closed: the flag off, a non-clearable (kill-switch) lock, a fetch
+        failure, or ANY live position all keep the lock latched. A local
+        straddle that is still open also keeps it latched — that combination
+        (exchange flat, local open) is the stale-state case, and releasing
+        there would let the next entry stack on a straddle we would then close
+        with fabricated exit prices. Only a clean, genuinely-flat read on BOTH
+        sides releases it.
+        """
+        if not config.SELF_HEAL_LOCK_ON_FLAT:
+            return False
+        if not self._lock_clearable_when_flat:
+            return False
+        try:
+            positions = await self.exchange.list_open_positions()
+        except Exception:
+            log.warning("orphan_lock_recheck_fetch_failed", exc_info=True)
+            return False
+        if positions:
+            log.info("orphan_lock_still_not_flat", positions=len(positions))
+            return False
+        if self.portfolio.has_open:
+            log.warning("orphan_lock_exchange_flat_but_local_open",
+                        reason=self._lock_reason)
+            return False
+        prior = self._lock_reason
+        self._entry_locked = False
+        self._lock_reason = ""
+        self._lock_clearable_when_flat = False
+        log.warning("orphan_lock_auto_released", prior_reason=prior)
+        await notifier.send(
+            "<b>✅ ENTRY LOCK AUTO-CLEARED</b>\n"
+            "The exchange is now flat — the earlier orphan/position lock has "
+            "released on its own (e.g. a worthless leg settled at expiry). "
+            "Trading resumes.\n\n"
+            f"<i>Cleared lock:</i> {prior}"
+        )
+        return True
+
     # ──────────────────── Startup Safeguards ──────────────────────
 
     def _validate_chase_deadline_fits_session(self) -> None:
@@ -252,8 +318,7 @@ class Algo:
         shortest = min(config.SESSION_SCHEDULE, key=lambda s: s.window_min)
         window_min = shortest.window_min
         if config.OPTION_CHASE_DEADLINE_MIN > max(0, window_min - buffer_min):
-            self._entry_locked = True
-            self._lock_reason = (
+            self._set_entry_lock(
                 f"OPTION_CHASE_DEADLINE_MIN={config.OPTION_CHASE_DEADLINE_MIN} "
                 f"does not fit shortest session window "
                 f"({shortest.name} {window_min}min) − {buffer_min}min "
@@ -297,8 +362,7 @@ class Algo:
             exchange_positions = await self.exchange.list_open_positions()
         except Exception:
             log.error("reconcile_fetch_failed", exc_info=True)
-            self._entry_locked = True
-            self._lock_reason = "Could not fetch positions from Derive"
+            self._set_entry_lock("Could not fetch positions from Derive")
             await notifier.notify_error(
                 "Startup reconciliation",
                 "Failed to fetch exchange positions — entries blocked")
@@ -320,23 +384,34 @@ class Algo:
                 f"uPnL=${p['unrealized_pnl']:+,.2f}"
                 for p in exchange_positions
             )
-            self._entry_locked = True
-            self._lock_reason = (
+            self._set_entry_lock(
                 f"Exchange has {len(exchange_positions)} open position(s) "
-                f"but algo state is empty — possible orphan"
+                f"but algo state is empty — possible orphan",
+                clearable_when_flat=True,
+            )
+            action = (
+                "Entries are locked, but this lock AUTO-CLEARS on the next "
+                "session once the exchange is flat again (e.g. a worthless "
+                "leg settling at expiry) — no restart needed. To resume "
+                "sooner, flatten with tools/force_liquidate.py."
+                if config.SELF_HEAL_LOCK_ON_FLAT else
+                "Entry locked until manually resolved. Either close the "
+                "positions or update positions.json."
             )
             await notifier.send(
                 f"<b>⚠️ RECONCILIATION MISMATCH</b>\n"
                 f"Exchange has open positions but algo state is empty.\n\n"
                 f"<b>Exchange positions:</b>\n{details}\n\n"
-                f"<b>ACTION</b>: Entry locked until manually resolved.\n"
-                f"Either close the positions or update positions.json.\n"
+                f"<b>ACTION</b>: {action}\n"
             )
             return
 
         if local_has_straddle and not exchange_has_positions:
-            self._entry_locked = True
-            self._lock_reason = (
+            # NOT clearable-when-flat: the exchange is flat BY DEFINITION here,
+            # so marking it clearable would auto-release instantly and let the
+            # next entry stack on a phantom local straddle. Operator must clear
+            # state/positions.json.
+            self._set_entry_lock(
                 "Algo state has open straddle but exchange shows flat — "
                 "stale positions.json"
             )
@@ -388,8 +463,7 @@ class Algo:
                      sim_price=sim_price, ok_positive=ok_positive,
                      ok_absolute=ok_absolute, ok_over_mark=ok_over_mark)
             if not (ok_positive and ok_absolute and ok_over_mark):
-                self._entry_locked = True
-                self._lock_reason = (
+                self._set_entry_lock(
                     f"Chase self-test failed: sim_price=${sim_price:,.2f} "
                     f"vs mark=${mark:,.2f} (abs_ok={ok_absolute}, "
                     f"over_mark_ok={ok_over_mark}) — possible unit/tick bug"
@@ -420,9 +494,16 @@ class Algo:
         log.info("session_entry_start")
 
         if self._entry_locked:
-            log.warning("entry_blocked_lock", reason=self._lock_reason)
-            await notifier.notify_skip(f"Entry locked: {self._lock_reason}")
-            return
+            # Orphan/position locks may auto-release once the exchange is
+            # confirmed flat (e.g. a worthless leg settled at expiry) so we
+            # don't need a manual restart — which could not clear this anyway,
+            # since the startup reconcile re-locks while the residual exists.
+            # Kill-switch locks never clear here.
+            released = await self._maybe_release_orphan_lock()
+            if not released:
+                log.warning("entry_blocked_lock", reason=self._lock_reason)
+                await notifier.notify_skip(f"Entry locked: {self._lock_reason}")
+                return
 
         api_check = self.risk.check_api_health(
             self.exchange.error_count_effective())
@@ -457,17 +538,25 @@ class Algo:
                     f"{p['instrument_name']} {p['amount']:+.4f}"
                     for p in live_positions
                 )
-                self._entry_locked = True
-                self._lock_reason = (
+                self._set_entry_lock(
                     f"Pre-entry exchange not flat: {len(live_positions)} "
-                    f"open position(s) — possible orphan, refusing to stack"
+                    f"open position(s) — possible orphan, refusing to stack",
+                    clearable_when_flat=True,
                 )
                 log.error("entry_blocked_exchange_not_flat", positions=detail)
+                action = (
+                    "possible orphan. Entries LOCKED, but this lock "
+                    "AUTO-CLEARS on the next session once the exchange is flat "
+                    "again — no restart needed. To resume sooner, flatten with "
+                    "tools/force_liquidate.py."
+                    if config.SELF_HEAL_LOCK_ON_FLAT else
+                    "possible orphan. Entries LOCKED — flatten manually "
+                    "(tools/force_liquidate.py) and restart."
+                )
                 await notifier.send(
                     f"<b>⚠️ ENTRY BLOCKED — EXCHANGE NOT FLAT</b>\n"
                     f"{len(live_positions)} open position(s): {detail}\n\n"
-                    f"<b>ACTION</b>: possible orphan. Entries LOCKED — "
-                    f"flatten manually (tools/force_liquidate.py) and restart."
+                    f"<b>ACTION</b>: {action}"
                 )
                 return
 
@@ -635,8 +724,7 @@ class Algo:
         if (config.CONSECUTIVE_FAILURE_LIMIT > 0
                 and self._consecutive_failures
                 >= config.CONSECUTIVE_FAILURE_LIMIT):
-            self._entry_locked = True
-            self._lock_reason = (
+            self._set_entry_lock(
                 f"{self._consecutive_failures} consecutive session failures "
                 f"— restart algo to reset"
             )
@@ -784,10 +872,10 @@ class Algo:
                     exit_put = overrides[straddle.put_leg.instrument]
 
             if not flat:
-                self._entry_locked = True
-                self._lock_reason = (
+                self._set_entry_lock(
                     "Post-close exchange NOT flat after re-flatten budget — "
-                    "orphan; straddle kept OPEN locally, entries locked"
+                    "orphan; straddle kept OPEN locally, entries locked",
+                    clearable_when_flat=True,
                 )
                 log.error("post_close_not_flat_lock", id=straddle.id)
                 await notifier.send(
