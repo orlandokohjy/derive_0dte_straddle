@@ -95,6 +95,21 @@ def test_persistent_sell_rejection_surfaces_the_error(monkeypatch):
     assert "SELF_TRADING_DISALLOWED" in result.get("error", "")
 
 
+def test_empty_place_result_falls_back_to_rejected_label(monkeypatch):
+    """Legacy _place_limit_order returned {} with no error key — chase must
+    still abort cleanly (as rejected_by_exchange) rather than hang or report
+    a no-fill. The production path now also returns {"error": ...}; this
+    covers the empty-dict case so a regression can't silently reintroduce
+    the old break-on-first-reject behaviour.
+    """
+    ex, calls = _exchange(monkeypatch, [{}])
+    result = asyncio.run(ex.chase_buy("BTC-20260805-64500-C", 0.1, 200.0))
+
+    assert result.get("rejected_by_exchange") is True
+    assert result.get("error") == "rejected"
+    assert calls["n"] == _PLACE_ERROR_ABORT_ATTEMPTS
+
+
 def test_rejection_is_reported_as_failed_not_a_bad_fill(monkeypatch):
     """build_straddle must name the rejection, not blame a $0 fill price."""
     from strategy import straddle_builder

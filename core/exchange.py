@@ -324,7 +324,10 @@ class DeriveExchange:
                 return {"rejected_post_only": True}
             log.warning("order_failed", instrument=instrument, error=err_str)
             self._note_error()
-            return {}
+            # Carry the error string: chase_buy/chase_sell used to fall back
+            # to a bare "rejected" in Telegram because this returned {}. The
+            # real reason lived only in order_failed log lines.
+            return {"error": err_str}
 
     async def taker_flatten(
         self, instrument: str, signed_amt: float,
