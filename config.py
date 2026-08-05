@@ -166,11 +166,11 @@ OPTION_TICK_SIZE: float = float(os.getenv("OPTION_TICK_SIZE", "5.0"))
 # Chase logic: on each retry narrow the gap to the ask/bid by this pct
 OPTION_CHASE_GAP_NARROW_PCT: float = float(os.getenv("OPTION_CHASE_GAP_NARROW_PCT", "0.5"))
 # Hard cap on our buy price: mark * MAX_SLIPPAGE_FACTOR. Also floor on sell.
-# Derive 0DTE books are thin — 1.15× left many sessions sitting at the cap
-# with no fill. 1.50× still refuses a wild ask but lets the chase walk further
-# into a wide book. Override via .env if needed.
+# Derive 0DTE books are thin — 1.15× / 1.50× left many sessions sitting at the
+# cap with no fill. 3.0× lets the chase walk almost to the ask on a wide book
+# (still post-only, so we never cross). Override via .env if needed.
 OPTION_CHASE_MAX_SLIPPAGE_FACTOR: float = float(
-    os.getenv("OPTION_CHASE_MAX_SLIPPAGE_FACTOR", "1.50")
+    os.getenv("OPTION_CHASE_MAX_SLIPPAGE_FACTOR", "3.0")
 )
 # Abort chase after this many minutes of no full fill
 OPTION_CHASE_DEADLINE_MIN: float = float(os.getenv("OPTION_CHASE_DEADLINE_MIN", "10.0"))
@@ -251,9 +251,9 @@ CHASE_SELFTEST_ENABLED: bool = os.getenv(
 # Capped chase price must not exceed mark × (1 + this).
 # Keep this ≥ OPTION_CHASE_MAX_SLIPPAGE_FACTOR − 1, or the self-test locks
 # entries the moment the chase is allowed to walk out to its own slip cap
-# (1.50× mark needs ≥ 0.50; default 0.55 leaves a small buffer).
+# (3.0× mark needs ≥ 2.0; default 2.05 leaves a small buffer).
 CHASE_SELFTEST_MAX_OVER_MARK: float = float(
-    os.getenv("CHASE_SELFTEST_MAX_OVER_MARK", "0.55")
+    os.getenv("CHASE_SELFTEST_MAX_OVER_MARK", "2.05")
 )
 # Absolute ceiling (USD) on any single-leg option price we would ever pay.
 # A BTC 0DTE option premium should never approach this; a larger value
