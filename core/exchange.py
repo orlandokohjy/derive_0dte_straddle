@@ -42,6 +42,23 @@ def _is_insufficient_funds(err_str: str) -> bool:
     return any(token in upper for token in INSUFFICIENT_FUNDS_TOKENS)
 
 
+def _is_stale_instrument_cache(err_str: str) -> bool:
+    """derive-client order path looks instruments up in a local cache that
+    ``connect()`` populates once. After the 08:00 UTC 0DTE roll, tickers can
+    already see today's strikes while the cache still holds yesterday's —
+    orders then die with 'not found in … instrument cache' / 'local cache is
+    stale'. Detect that so we can refresh and retry instead of burning the
+    rejection budget on a self-inflicted miss.
+    """
+    lower = err_str.lower()
+    return (
+        "instrument cache" in lower
+        or "local cache is stale" in lower
+        or "fetch_instruments" in lower
+        or "fetch_all_instruments" in lower
+    )
+
+
 # Tolerance for cap/floor comparisons — mark * 1.15 and mark / 1.15 land on
 # unrepresentable binaries, so an exact `>` / `<` misjudges an on-grid price.
 _EPS = 1e-6
@@ -105,10 +122,50 @@ class DeriveExchange:
 
         self._client = HTTPClient.from_env()
         self._client.connect()
+        # connect() already calls fetch_all_instruments once; we still expose
+        # an explicit refresh for the post-expiry-roll case (see
+        # refresh_option_instruments).
         log.info("derive_client_connected",
                  env=config.DERIVE_ENV,
                  wallet=config.DERIVE_WALLET[:10] + "..." if config.DERIVE_WALLET else "N/A",
                  subaccount=config.DERIVE_SUBACCOUNT_ID)
+
+    async def refresh_option_instruments(self) -> int:
+        """Re-fetch active option instruments into derive-client's local cache.
+
+        Must be called after every 0DTE expiry roll (and before any order on a
+        newly listed strike). Tickers can see today's chain while the client's
+        InstrumentType.option cache still holds yesterday's — orders then
+        reject with "not found in instrument cache". Returns the number of
+        option instruments now cached, or -1 if the refresh itself failed.
+        """
+        if self._client is None:
+            return -1
+        try:
+            from derive_client import data_types as _dt
+            markets = self._client.markets
+            # Newer derive-client builds take InstrumentType; older ones take
+            # AssetType. Prefer InstrumentType (matches the error string).
+            opt_type = getattr(getattr(_dt, "InstrumentType", None), "option", None)
+            if opt_type is None:
+                opt_type = getattr(_dt.AssetType, "option")
+
+            def _do_fetch():
+                if hasattr(markets, "fetch_instruments"):
+                    return markets.fetch_instruments(
+                        instrument_type=opt_type, expired=False,
+                    )
+                return markets.fetch_all_instruments(expired=False)
+
+            result = await asyncio.get_running_loop().run_in_executor(
+                None, _do_fetch,
+            )
+            n = len(result) if result is not None else 0
+            log.info("option_instrument_cache_refreshed", count=n)
+            return n
+        except Exception:
+            log.warning("option_instrument_cache_refresh_failed", exc_info=True)
+            return -1
 
     # ──────────────────── Market Data ─────────────────────────────
 
@@ -322,6 +379,10 @@ class DeriveExchange:
             ):
                 log.debug("post_only_rejected", instrument=instrument, price=price)
                 return {"rejected_post_only": True}
+            if _is_stale_instrument_cache(err_str):
+                log.warning("order_stale_instrument_cache",
+                            instrument=instrument, error=err_str[:300])
+                return {"rejected_stale_cache": True, "error": err_str}
             log.warning("order_failed", instrument=instrument, error=err_str)
             self._note_error()
             # Carry the error string: chase_buy/chase_sell used to fall back
@@ -527,6 +588,7 @@ class DeriveExchange:
         cap_blocked = 0
         place_errors = 0
         last_place_error = ""
+        cache_refreshed = False
 
         while _time.time() < deadline and remaining_qty > 0:
             attempt += 1
@@ -590,6 +652,32 @@ class DeriveExchange:
             if result.get("rejected_post_only"):
                 log.debug("chase_buy_post_only_reject", instrument=instrument,
                           price=price, attempt=attempt)
+                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                continue
+            if result.get("rejected_stale_cache"):
+                # One refresh absorbs the post-expiry-roll miss; further
+                # identical rejects fall through to the normal reject budget
+                # so a genuinely unknown instrument still aborts.
+                if not cache_refreshed:
+                    cache_refreshed = True
+                    log.warning("chase_buy_refreshing_stale_cache",
+                                instrument=instrument, attempt=attempt)
+                    await self.refresh_option_instruments()
+                    await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                    continue
+                # Already refreshed once this chase — treat as a hard reject.
+                place_errors += 1
+                last_place_error = str(result.get("error", "")) or "stale cache"
+                if place_errors >= _PLACE_ERROR_ABORT_ATTEMPTS:
+                    log.error("chase_buy_rejected_abort", instrument=instrument,
+                              attempts=attempt, consecutive_rejects=place_errors,
+                              error=last_place_error[:300])
+                    return {"rejected_by_exchange": True,
+                            "error": last_place_error,
+                            "filled_amount": str(total_filled),
+                            "remaining_amount": str(remaining_qty),
+                            "average_price": str(weighted_cost / total_filled)
+                                             if total_filled > 0 else "0"}
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
             order_id = result.get("order_id", "")
@@ -733,6 +821,7 @@ class DeriveExchange:
         floor_blocked = 0
         place_errors = 0
         last_place_error = ""
+        cache_refreshed = False
 
         while _time.time() < deadline and remaining_qty > 0:
             attempt += 1
@@ -794,6 +883,29 @@ class DeriveExchange:
             if result.get("rejected_post_only"):
                 log.debug("chase_sell_post_only_reject", instrument=instrument,
                           price=price, attempt=attempt)
+                await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                continue
+            if result.get("rejected_stale_cache"):
+                if not cache_refreshed:
+                    cache_refreshed = True
+                    log.warning("chase_sell_refreshing_stale_cache",
+                                instrument=instrument, attempt=attempt)
+                    await self.refresh_option_instruments()
+                    await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
+                    continue
+                place_errors += 1
+                last_place_error = str(result.get("error", "")) or "stale cache"
+                if place_errors >= _PLACE_ERROR_ABORT_ATTEMPTS:
+                    log.error("chase_sell_rejected_abort",
+                              instrument=instrument, attempts=attempt,
+                              consecutive_rejects=place_errors,
+                              error=last_place_error[:300])
+                    return {"rejected_by_exchange": True,
+                            "error": last_place_error,
+                            "filled_amount": str(total_filled),
+                            "remaining_amount": str(remaining_qty),
+                            "average_price": str(weighted_revenue / total_filled)
+                                             if total_filled > 0 else "0"}
                 await asyncio.sleep(config.OPTION_CHASE_INTERVAL_SEC)
                 continue
             order_id = result.get("order_id", "")

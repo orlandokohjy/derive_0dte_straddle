@@ -42,11 +42,22 @@ class OptionChain:
         """
         Fetch all BTC 0DTE option tickers in a single bulk call.
 
+        Also refreshes derive-client's local option-instrument cache. Tickers
+        can already see today's strikes after the 08:00 UTC roll while the
+        client's order-signing cache still holds yesterday's — without this
+        refresh, every order dies with "not found in instrument cache".
+
         Returns the total number of 0DTE instruments found.
         """
         expiry_api = today_expiry_api_str()
         self.calls.clear()
         self.puts.clear()
+
+        # Refresh the client-side instrument cache BEFORE we pick strikes /
+        # place orders. Cheap relative to a wasted chase, and the only way
+        # to keep a long-lived container healthy across the daily expiry roll.
+        if self._exchange is not None:
+            await self._exchange.refresh_option_instruments()
 
         tickers = await self._exchange.get_tickers_for_expiry(
             currency=config.BASE_COIN, expiry_date=expiry_api,
