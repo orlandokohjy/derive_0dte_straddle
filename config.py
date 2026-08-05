@@ -172,8 +172,9 @@ OPTION_CHASE_GAP_NARROW_PCT: float = float(os.getenv("OPTION_CHASE_GAP_NARROW_PC
 OPTION_CHASE_MAX_SLIPPAGE_FACTOR: float = float(
     os.getenv("OPTION_CHASE_MAX_SLIPPAGE_FACTOR", "3.0")
 )
-# Abort chase after this many minutes of no full fill
-OPTION_CHASE_DEADLINE_MIN: float = float(os.getenv("OPTION_CHASE_DEADLINE_MIN", "10.0"))
+# Abort chase after this many minutes of no full fill.
+# Must stay ≤ shortest_session_window − 5 (30-min holds → max 25).
+OPTION_CHASE_DEADLINE_MIN: float = float(os.getenv("OPTION_CHASE_DEADLINE_MIN", "20.0"))
 
 # Pre-entry spread sanity gate — skip session if either leg's
 # (ask − bid) / mid > this. 0.30 = skip if spread is wider than 30 % of mid.
