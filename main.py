@@ -894,7 +894,6 @@ class Algo:
             pnl = self.portfolio.close_straddle(
                 exit_call, exit_put, "session_close",
             )
-            await notifier.notify_close(pnl, "session_close")
 
             if not config.DRY_RUN:
                 live_equity = await self.exchange.get_subaccount_collateral()
@@ -903,6 +902,15 @@ class Algo:
                                 persisted=self.portfolio.equity)
                 else:
                     self.portfolio.sync_equity(live_equity)
+
+            # Rich OKX-parity close (entry/exit per leg + equity delta).
+            # Sync equity BEFORE notifying so Equity: before → after is live.
+            await notifier.notify_close(
+                pnl, "session_close",
+                straddle=straddle,
+                equity_before=equity_before,
+                equity_after=self.portfolio.equity,
+            )
 
             actual_pnl = self.portfolio.equity - equity_before
             if actual_pnl != 0.0:

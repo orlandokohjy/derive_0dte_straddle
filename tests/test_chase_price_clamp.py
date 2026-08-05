@@ -58,18 +58,26 @@ def test_sell_clamp_never_undercuts_slip_floor():
         )
 
 
-def test_the_exact_deadlocked_quote_from_the_log():
-    """mark=218, ask~256 — the quote that produced 116 dead attempts."""
+def test_the_exact_deadlocked_quote_from_the_log(monkeypatch):
+    """mark=218, ask~256 — the quote that produced 116 dead attempts.
+
+    Pinned at the historical 1.15 factor: under today's looser default (1.50)
+    the slip cap clears the ask and the chase bids near the book instead,
+    which is the intended fix — but this regression must keep asserting the
+    old clamp-rounding bug at the factor that exposed it.
+    """
+    monkeypatch.setattr(config, "OPTION_CHASE_MAX_SLIPPAGE_FACTOR", 1.15)
     price = _clamped_buy_price(218.0, ask=256.0)
-    slip_cap = 218.0 * config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR  # 250.7
+    slip_cap = 218.0 * 1.15  # 250.7
     assert price <= slip_cap + _EPS
     assert price == 250.0, f"expected a $250 bid under the $250.7 cap, got {price}"
 
 
-def test_float_error_mark_does_not_block():
+def test_float_error_mark_does_not_block(monkeypatch):
     """mark=200 -> 200*1.15 == 229.999...97; a bare `>` blocked price 230.0."""
+    monkeypatch.setattr(config, "OPTION_CHASE_MAX_SLIPPAGE_FACTOR", 1.15)
     mark = 200.0
-    slip_cap = mark * config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR
+    slip_cap = mark * 1.15
     assert slip_cap < 230.0, "precondition: the cap is just under the tick"
     price = _clamped_buy_price(mark, ask=mark * 2.0)
     assert price <= slip_cap + _EPS

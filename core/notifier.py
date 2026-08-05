@@ -76,12 +76,121 @@ async def notify_entry(
     )
 
 
-async def notify_close(pnl: float, exit_reason: str) -> None:
-    pnl_sign = "+" if pnl >= 0 else ""
-    await send(
-        f"<b>SESSION CLOSE</b>\n"
-        f"P&L: {pnl_sign}${pnl:,.2f}\n"
+def _fmt_signed_usd(v: float) -> str:
+    sign = "+" if v >= 0 else ""
+    return f"{sign}${v:,.2f}"
+
+
+def _format_close_message(
+    pnl: float,
+    session_label: str = "",
+    straddle: object | None = None,
+    equity_before: float | None = None,
+    equity_after: float | None = None,
+) -> str:
+    """OKX-parity SESSION CLOSE body.
+
+    Derive premiums are already USD-per-BTC-of-notional (same shape as OKX
+    UM), so leg costs are ``premium × qty × num`` with no spot multiplier.
+    Falls back to the legacy two-line format when no straddle is supplied.
+    """
+    header = "<b>SESSION CLOSE</b>"
+    if session_label:
+        header = f"<b>SESSION CLOSE [{session_label}]</b>"
+
+    if straddle is None:
+        return f"{header}\nNet P&amp;L: {_fmt_signed_usd(pnl)}\n"
+
+    s = straddle
+    qty = float(getattr(s, "qty_per_leg", 0.0))
+    num = int(getattr(s, "num_straddles", 1))
+    call_strike = float(getattr(s, "strike", 0.0))
+    put_strike = float(getattr(s, "put_strike", 0.0) or call_strike)
+
+    call_leg = getattr(s, "call_leg", None)
+    put_leg = getattr(s, "put_leg", None)
+    call_inst = getattr(call_leg, "instrument", "?") if call_leg else "?"
+    put_inst = getattr(put_leg, "instrument", "?") if put_leg else "?"
+
+    entry_call = float(getattr(s, "entry_call_price", 0.0) or 0.0)
+    entry_put = float(getattr(s, "entry_put_price", 0.0) or 0.0)
+    exit_call = float(getattr(s, "exit_call_price", 0.0) or 0.0)
+    exit_put = float(getattr(s, "exit_put_price", 0.0) or 0.0)
+
+    call_entry_usd = entry_call * qty * num
+    call_exit_usd = exit_call * qty * num
+    put_entry_usd = entry_put * qty * num
+    put_exit_usd = exit_put * qty * num
+    call_pnl = call_exit_usd - call_entry_usd
+    put_pnl = put_exit_usd - put_entry_usd
+    gross = float(getattr(s, "gross_pnl", None) or (call_pnl + put_pnl))
+    fees = float(getattr(s, "fees", None) or 0.0)
+    net = float(getattr(s, "pnl", pnl) or pnl)
+
+    lines: list[str] = [header]
+    lines.append(f"ID: {getattr(s, 'id', '?')}")
+
+    if call_strike > 0 and put_strike > 0 and abs(put_strike - call_strike) > 1e-9:
+        lines.append(
+            f"Strikes: C ${call_strike:,.0f} / P ${put_strike:,.0f}  "
+            f"<i>(OTM strangle)</i>"
+        )
+    elif call_strike > 0:
+        lines.append(f"Strike: ${call_strike:,.0f}")
+
+    qty_line = f"Qty: {qty:.4f} BTC/leg"
+    if num != 1:
+        qty_line += f" × {num} straddles"
+    lines.append(qty_line)
+    lines.append("")
+
+    lines.append(f"<b>Call</b> {call_inst}")
+    lines.append(f"  Entry: ${entry_call:,.2f} (${call_entry_usd:,.2f})")
+    lines.append(f"  Exit:  ${exit_call:,.2f} (${call_exit_usd:,.2f})")
+    lines.append(f"  Leg P&amp;L: {_fmt_signed_usd(call_pnl)}")
+
+    lines.append(f"<b>Put</b> {put_inst}")
+    lines.append(f"  Entry: ${entry_put:,.2f} (${put_entry_usd:,.2f})")
+    lines.append(f"  Exit:  ${exit_put:,.2f} (${put_exit_usd:,.2f})")
+    lines.append(f"  Leg P&amp;L: {_fmt_signed_usd(put_pnl)}")
+    lines.append("")
+
+    lines.append(
+        f"<b>Gross P&amp;L:</b> {_fmt_signed_usd(gross)}  "
+        f"<i>(call + put)</i>"
     )
+    if fees >= 0:
+        lines.append(f"<b>Rebate:</b>    +${fees:,.2f}")
+    else:
+        lines.append(f"<b>Fees:</b>      -${abs(fees):,.2f}")
+    lines.append(f"<b>Net P&amp;L:</b>   {_fmt_signed_usd(net)}")
+
+    if equity_before is not None and equity_after is not None:
+        lines.append("")
+        lines.append(
+            f"Equity: ${equity_before:,.2f} → ${equity_after:,.2f}"
+        )
+
+    return "\n".join(lines)
+
+
+async def notify_close(
+    pnl: float,
+    exit_reason: str,
+    session_label: str = "",
+    straddle: object | None = None,
+    equity_before: float | None = None,
+    equity_after: float | None = None,
+) -> None:
+    """SESSION CLOSE — OKX-parity rich body when ``straddle`` is supplied."""
+    body = _format_close_message(
+        pnl,
+        session_label=session_label,
+        straddle=straddle,
+        equity_before=equity_before,
+        equity_after=equity_after,
+    )
+    await send(body)
 
 
 async def notify_skip(reason: str) -> None:

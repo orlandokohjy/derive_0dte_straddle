@@ -166,14 +166,21 @@ OPTION_TICK_SIZE: float = float(os.getenv("OPTION_TICK_SIZE", "5.0"))
 # Chase logic: on each retry narrow the gap to the ask/bid by this pct
 OPTION_CHASE_GAP_NARROW_PCT: float = float(os.getenv("OPTION_CHASE_GAP_NARROW_PCT", "0.5"))
 # Hard cap on our buy price: mark * MAX_SLIPPAGE_FACTOR. Also floor on sell.
-OPTION_CHASE_MAX_SLIPPAGE_FACTOR: float = float(os.getenv("OPTION_CHASE_MAX_SLIPPAGE_FACTOR", "1.15"))
+# Derive 0DTE books are thin — 1.15× left many sessions sitting at the cap
+# with no fill. 1.50× still refuses a wild ask but lets the chase walk further
+# into a wide book. Override via .env if needed.
+OPTION_CHASE_MAX_SLIPPAGE_FACTOR: float = float(
+    os.getenv("OPTION_CHASE_MAX_SLIPPAGE_FACTOR", "1.50")
+)
 # Abort chase after this many minutes of no full fill
 OPTION_CHASE_DEADLINE_MIN: float = float(os.getenv("OPTION_CHASE_DEADLINE_MIN", "10.0"))
 
 # Pre-entry spread sanity gate — skip session if either leg's
 # (ask − bid) / mid > this. 0.30 = skip if spread is wider than 30 % of mid.
+# Live stack runs 3.0 (300 %) so genuinely wide Derive books still trade;
+# the two-sided-quote gate still refuses legs with no bid/ask.
 OPTION_MAX_ENTRY_SPREAD_PCT: float = float(
-    os.getenv("OPTION_MAX_ENTRY_SPREAD_PCT", "0.30")
+    os.getenv("OPTION_MAX_ENTRY_SPREAD_PCT", "3.0")
 )
 
 # ──────────────────── Risk Management ─────────────────────────────
@@ -242,8 +249,11 @@ CHASE_SELFTEST_ENABLED: bool = os.getenv(
     "CHASE_SELFTEST_ENABLED", "true",
 ).lower() in ("true", "1", "yes", "on")
 # Capped chase price must not exceed mark × (1 + this).
+# Keep this ≥ OPTION_CHASE_MAX_SLIPPAGE_FACTOR − 1, or the self-test locks
+# entries the moment the chase is allowed to walk out to its own slip cap
+# (1.50× mark needs ≥ 0.50; default 0.55 leaves a small buffer).
 CHASE_SELFTEST_MAX_OVER_MARK: float = float(
-    os.getenv("CHASE_SELFTEST_MAX_OVER_MARK", "0.20")
+    os.getenv("CHASE_SELFTEST_MAX_OVER_MARK", "0.55")
 )
 # Absolute ceiling (USD) on any single-leg option price we would ever pay.
 # A BTC 0DTE option premium should never approach this; a larger value
