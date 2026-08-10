@@ -154,13 +154,38 @@ async def _flatten_one(
     except Exception as exc:
         return False, f"{symbol}: ticker fetch failed: {exc}"
     bid, ask = float(ticker.bid), float(ticker.ask)
-    if bid <= 0 or ask <= 0:
-        return False, f"{symbol}: invalid book bid={bid} ask={ask}"
+    mark = float(ticker.mark or 0.0)
+    print(f"  [{symbol}] book bid={bid} ask={ask} mark={mark}")
 
     if amt > 0:
-        direction, price = "sell", bid   # cross down to guarantee fill
+        # Sell the long. Prefer the live bid (true take); if the book has no
+        # bid (common on thin Derive 0DTE), fall back to an aggressive mark-
+        # based price so we still place a crossing sell instead of aborting
+        # and leaving the orphan locked forever.
+        direction = "sell"
+        if bid > 0:
+            price = bid
+        elif mark > 0:
+            price = max(mark * 0.5, config.OPTION_TICK_SIZE)
+            print(f"  [{symbol}] WARN: no bid — selling at 50% of mark "
+                  f"(${price:,.2f}) as taker")
+        else:
+            return False, (
+                f"{symbol}: cannot sell — bid={bid} mark={mark} "
+                f"(no book and no mark)"
+            )
     else:
-        direction, price = "buy", ask     # cross up
+        direction = "buy"
+        if ask > 0:
+            price = ask
+        elif mark > 0:
+            price = mark * 1.5
+            print(f"  [{symbol}] WARN: no ask — buying at 150% of mark "
+                  f"(${price:,.2f}) as taker")
+        else:
+            return False, (
+                f"{symbol}: cannot buy back — ask={ask} mark={mark}"
+            )
     qty = abs(amt)
 
     print(f"  [{symbol}] flatten plan: {direction} {qty:.4f} @ ${price:,.2f} "
