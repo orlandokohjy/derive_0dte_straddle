@@ -174,8 +174,17 @@ async def _flatten_one(
     )
     if order.get("rejected_insufficient_funds"):
         return False, f"{symbol}: REJECTED insufficient funds"
+    if order.get("rejected_stale_cache"):
+        # One more refresh + retry — connect-time cache can still miss a
+        # brand-new strike even after the pre-flight refresh above.
+        print(f"  [{symbol}] stale instrument cache — refreshing and retrying")
+        await exchange.refresh_option_instruments()
+        order = await exchange._place_limit_order(
+            symbol, direction, qty, price, post_only=False,
+        )
     if not order.get("order_id"):
-        return False, f"{symbol}: order not accepted: {order}"
+        err = order.get("error") or order
+        return False, f"{symbol}: order not accepted: {err}"
     print(f"  [{symbol}] order placed: id={order.get('order_id')} "
           f"status={order.get('order_status')}")
 
@@ -202,6 +211,14 @@ async def _liquidate(symbol: str | None, *, dry_run: bool) -> int:
 
     exchange = DeriveExchange()
     exchange.connect()
+
+    # Same footgun as live entry: connect() caches instruments once. A put
+    # listed after that (or after the 08:00 UTC roll) is invisible to the
+    # order path until we refresh — otherwise the taker sell dies with
+    # "not found in instrument cache" and the orphan stays forever.
+    n = await exchange.refresh_option_instruments()
+    print(f"[force_liquidate] refreshed option instrument cache "
+          f"(count={n})")
 
     try:
         positions = await exchange.list_open_positions()
