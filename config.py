@@ -217,21 +217,25 @@ SELF_HEAL_LOCK_ON_FLAT: bool = os.getenv(
 ).strip().lower() in ("1", "true", "yes")
 
 # ──────────────────── OKX-parity reliability hardening ────────────
-# Persistent post-close re-flatten: after the unwind, if the exchange is
-# NOT flat we loop selling the residual long legs until either the account
-# is flat or this wall-clock budget (minutes) is exhausted. If still not
-# flat at the end, the algo LOCKS entries (orphan) rather than recording a
-# phantom close. CLOSE_FLATTEN_ROUND_MIN is the pause between rounds.
+# Post-close re-flatten: after the unwind, if the exchange is NOT flat we
+# loop closing residual legs. CLOSE_FLATTEN_BUDGET_MIN is a SOFT budget —
+# used for the first Telegram alert / escalation timing. With
+# CLOSE_FLATTEN_PERSIST=true (default) the loop NEVER stops until the
+# exchange is flat (no orphan lock, no force_liquidate). Set persist false
+# to restore the old "budget then orphan-lock" behaviour.
 CLOSE_FLATTEN_BUDGET_MIN: float = float(
     os.getenv("CLOSE_FLATTEN_BUDGET_MIN", "10.0")
 )
 CLOSE_FLATTEN_ROUND_MIN: float = float(
     os.getenv("CLOSE_FLATTEN_ROUND_MIN", "1.0")
 )
+CLOSE_FLATTEN_PERSIST: bool = os.getenv(
+    "CLOSE_FLATTEN_PERSIST", "true",
+).strip().lower() in ("1", "true", "yes", "on")
 # Taker escalation (OKX parity): after this many maker-only re-flatten
 # rounds fail to clear a residual leg, the post-close reconcile crosses the
-# spread with a TAKER order to guarantee the close, rather than locking as
-# an orphan. Set very high to keep the reconcile maker-only.
+# spread with a TAKER order. Past the soft budget, taker is forced every
+# round when persist is on.
 CLOSE_FLATTEN_TAKER_AFTER_ROUNDS: int = int(
     os.getenv("CLOSE_FLATTEN_TAKER_AFTER_ROUNDS", "2")
 )

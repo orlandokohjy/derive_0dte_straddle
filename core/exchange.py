@@ -399,6 +399,10 @@ class DeriveExchange:
         live position (+long / −short, in BTC): a long is SOLD at the bid, a
         short is BOUGHT at the ask. Returns the order dict on success (with
         ``average_price``), or None on a bad book / rejection.
+
+        Thin 0DTE books often have bid=0 (or ask=0). Mirror force_liquidate:
+        fall back to an aggressive mark-based cross rather than aborting and
+        leaving the residual stuck until someone runs the tool by hand.
         """
         qty = abs(signed_amt)
         if qty < 1e-9:
@@ -409,23 +413,51 @@ class DeriveExchange:
             log.warning("taker_flatten_ticker_failed", instrument=instrument)
             return None
         bid, ask = float(ticker.bid), float(ticker.ask)
-        if bid <= 0 or ask <= 0:
-            log.warning("taker_flatten_bad_book", instrument=instrument,
-                        bid=bid, ask=ask)
-            return None
+        mark = float(getattr(ticker, "mark", 0.0) or 0.0)
         if signed_amt > 0:
-            direction, price = "sell", bid   # cross DOWN to guarantee fill
+            direction = "sell"
+            if bid > 0:
+                price = bid
+            elif mark > 0:
+                price = max(mark * 0.5, config.OPTION_TICK_SIZE)
+                log.warning("taker_flatten_no_bid_mark_fallback",
+                            instrument=instrument, mark=mark, price=price)
+            else:
+                log.warning("taker_flatten_bad_book", instrument=instrument,
+                            bid=bid, ask=ask, mark=mark)
+                return None
         else:
-            direction, price = "buy", ask     # cross UP
+            direction = "buy"
+            if ask > 0:
+                price = ask
+            elif mark > 0:
+                price = mark * 1.5
+                log.warning("taker_flatten_no_ask_mark_fallback",
+                            instrument=instrument, mark=mark, price=price)
+            else:
+                log.warning("taker_flatten_bad_book", instrument=instrument,
+                            bid=bid, ask=ask, mark=mark)
+                return None
         log.warning("taker_flatten_crossing", instrument=instrument,
                     direction=direction, qty=qty, price=price,
-                    book=f"{bid}/{ask}")
+                    book=f"{bid}/{ask}", mark=mark)
         order = await self._place_limit_order(
             instrument, direction, qty, price, post_only=False,
         )
         if order.get("rejected_insufficient_funds"):
             log.error("taker_flatten_insufficient_funds", instrument=instrument)
             return None
+        if order.get("rejected_stale_cache"):
+            log.warning("taker_flatten_refreshing_stale_cache",
+                        instrument=instrument)
+            try:
+                await self.refresh_option_instruments()
+            except Exception:
+                log.warning("taker_flatten_cache_refresh_failed",
+                            instrument=instrument, exc_info=True)
+            order = await self._place_limit_order(
+                instrument, direction, qty, price, post_only=False,
+            )
         if not order.get("order_id"):
             log.error("taker_flatten_not_accepted", instrument=instrument,
                       order=order)
@@ -555,6 +587,7 @@ class DeriveExchange:
 
     async def chase_buy(
         self, instrument: str, qty: float, initial_bid: float,
+        deadline_min: float | None = None,
     ) -> dict | None:
         """
         Maker-only buy with 50%-gap narrowing + fair-value cap + deadline.
@@ -566,22 +599,30 @@ class DeriveExchange:
 
         Aborts on "Insufficient funds" errors (propagates rejected_insufficient_funds).
         Uses post_only (exchange rejects if crosses spread). Never a taker.
+
+        ``deadline_min`` overrides OPTION_CHASE_DEADLINE_MIN — used by the
+        post-close re-flatten so a single maker round cannot burn the whole
+        soft budget before taker escalation.
         """
         if config.DRY_RUN:
             return {"order_id": f"dry-{uuid.uuid4().hex[:12]}",
                     "order_status": "filled", "average_price": str(initial_bid)}
 
+        chase_deadline = (
+            config.OPTION_CHASE_DEADLINE_MIN
+            if deadline_min is None else float(deadline_min)
+        )
         log.info("chase_buy_maker_start", instrument=instrument, qty=qty,
                  initial_bid=initial_bid,
                  gap_pct=config.OPTION_CHASE_GAP_NARROW_PCT,
                  slip_factor=config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR,
-                 deadline_min=config.OPTION_CHASE_DEADLINE_MIN)
+                 deadline_min=chase_deadline)
         tick = config.OPTION_TICK_SIZE
         remaining_qty = qty
         weighted_cost = 0.0
         total_filled = 0.0
 
-        deadline = _time.time() + config.OPTION_CHASE_DEADLINE_MIN * 60.0
+        deadline = _time.time() + chase_deadline * 60.0
         current_price = _round_price(
             initial_bid if initial_bid > 0 else tick, "down")
         attempt = 0
@@ -790,6 +831,7 @@ class DeriveExchange:
 
     async def chase_sell(
         self, instrument: str, qty: float, initial_ask: float,
+        deadline_min: float | None = None,
     ) -> dict | None:
         """
         Maker-only sell with 50%-gap narrowing + fair-value floor + deadline.
@@ -799,22 +841,30 @@ class DeriveExchange:
           - price is hard-floored at max(bid + tick, mark / MAX_SLIPPAGE_FACTOR)
 
         Aborts on "Insufficient funds" errors. Uses post_only. Never a taker.
+
+        ``deadline_min`` overrides OPTION_CHASE_DEADLINE_MIN — used by the
+        post-close re-flatten so a single maker round cannot burn the whole
+        soft budget before taker escalation.
         """
         if config.DRY_RUN:
             return {"order_id": f"dry-{uuid.uuid4().hex[:12]}",
                     "order_status": "filled", "average_price": str(initial_ask)}
 
+        chase_deadline = (
+            config.OPTION_CHASE_DEADLINE_MIN
+            if deadline_min is None else float(deadline_min)
+        )
         log.info("chase_sell_maker_start", instrument=instrument, qty=qty,
                  initial_ask=initial_ask,
                  gap_pct=config.OPTION_CHASE_GAP_NARROW_PCT,
                  slip_factor=config.OPTION_CHASE_MAX_SLIPPAGE_FACTOR,
-                 deadline_min=config.OPTION_CHASE_DEADLINE_MIN)
+                 deadline_min=chase_deadline)
         tick = config.OPTION_TICK_SIZE
         remaining_qty = qty
         weighted_revenue = 0.0
         total_filled = 0.0
 
-        deadline = _time.time() + config.OPTION_CHASE_DEADLINE_MIN * 60.0
+        deadline = _time.time() + chase_deadline * 60.0
         current_price = _round_price(
             initial_ask if initial_ask > 0 else tick, "up")
         attempt = 0

@@ -148,6 +148,8 @@ class Algo:
         # _maybe_release_orphan_lock). Kill-switch locks leave this False.
         self._lock_clearable_when_flat: bool = False
         self._consecutive_failures: int = 0
+        # Guards concurrent re-flatten loops (close vs startup resume).
+        self._reflatten_active: bool = False
 
     async def start(self) -> None:
         setup_logging()
@@ -178,6 +180,10 @@ class Algo:
             await self._startup_cancel_stale_orders()
             await self._startup_reconcile_positions()
             await self._chase_pricing_selftest()
+            # If a prior close left the straddle OPEN with exchange residual
+            # (orphan), resume auto-flatten immediately — do not wait for the
+            # next session close or a manual force_liquidate.
+            asyncio.create_task(self._resume_unclosed_straddle())
 
         spot = await self.exchange.get_spot_price()
 
@@ -741,23 +747,32 @@ class Algo:
     ) -> tuple[bool, dict[str, float]]:
         """After the unwind, if the exchange is NOT flat, persistently
         re-flatten residual legs (sell longs / buy back shorts) until the
-        account is flat or the wall-clock budget is exhausted.
+        account is flat.
+
+        With ``CLOSE_FLATTEN_PERSIST`` (default on) this NEVER gives up —
+        the soft ``CLOSE_FLATTEN_BUDGET_MIN`` only gates the first alert /
+        forcing taker every round thereafter. Operators should not need
+        ``force_liquidate`` for post-close residuals.
 
         Returns ``(flat, exit_overrides)`` where ``exit_overrides`` maps a
         straddle leg instrument to the average price we actually got when
-        re-flattening it (used for accurate close P&L). Ports the OKX
-        ``_flatten_residual_until_flat`` behaviour.
+        re-flattening it (used for accurate close P&L).
         """
         instruments = {
             straddle.call_leg.instrument, straddle.put_leg.instrument,
         }
         overrides: dict[str, float] = {}
-        deadline = _time.monotonic() + config.CLOSE_FLATTEN_BUDGET_MIN * 60.0
+        soft_deadline = (
+            _time.monotonic() + config.CLOSE_FLATTEN_BUDGET_MIN * 60.0
+        )
         alerted = False
         taker_alerted = False
+        persist_alerted = False
         round_i = 0
+        last_progress_alert = 0.0
 
         while True:
+            past_soft = _time.monotonic() >= soft_deadline
             try:
                 positions = await self.exchange.list_open_positions()
             except Exception:
@@ -774,39 +789,72 @@ class Algo:
                     return True, overrides
 
                 round_i += 1
+                detail = ", ".join(
+                    f"{p['instrument_name']} {float(p['amount']):+.4f}"
+                    for p in residual
+                )
                 if not alerted:
                     alerted = True
-                    detail = ", ".join(
-                        f"{p['instrument_name']} {float(p['amount']):+.4f}"
-                        for p in residual
+                    persist_note = (
+                        " Will keep trying automatically until flat "
+                        "(no manual flatten required)."
+                        if config.CLOSE_FLATTEN_PERSIST else
+                        f" Soft budget {config.CLOSE_FLATTEN_BUDGET_MIN:.0f} min."
                     )
                     await notifier.send(
                         f"<b>🔁 POST-CLOSE RE-FLATTEN</b>\n"
-                        f"Exchange not flat after unwind — re-selling "
-                        f"residual (budget {config.CLOSE_FLATTEN_BUDGET_MIN:.0f} "
-                        f"min): {detail}"
+                        f"Exchange not flat after unwind — closing residual."
+                        f"{persist_note}\n"
+                        f"{detail}"
                     )
 
-                # Taker escalation (OKX parity): after N maker rounds fail
-                # to clear the residual, cross the spread with a TAKER order
-                # to guarantee the close instead of locking as an orphan.
-                use_taker = round_i > config.CLOSE_FLATTEN_TAKER_AFTER_ROUNDS
+                # Taker after N maker rounds, or immediately once past the
+                # soft budget under persist (don't waste time on more maker).
+                use_taker = (
+                    round_i > config.CLOSE_FLATTEN_TAKER_AFTER_ROUNDS
+                    or (past_soft and config.CLOSE_FLATTEN_PERSIST)
+                )
                 if use_taker and not taker_alerted:
                     taker_alerted = True
                     await notifier.send(
                         f"<b>⚠️ RE-FLATTEN → TAKER</b>\n"
-                        f"{config.CLOSE_FLATTEN_TAKER_AFTER_ROUNDS} maker "
-                        f"round(s) did not clear the residual — crossing the "
-                        f"spread (taker) to guarantee the close."
+                        f"Maker rounds did not clear the residual — crossing "
+                        f"the spread (taker) and continuing until flat."
                     )
 
+                if (past_soft and config.CLOSE_FLATTEN_PERSIST
+                        and not persist_alerted):
+                    persist_alerted = True
+                    last_progress_alert = _time.monotonic()
+                    await notifier.send(
+                        f"<b>🔄 RE-FLATTEN CONTINUING</b>\n"
+                        f"Still not flat after "
+                        f"{config.CLOSE_FLATTEN_BUDGET_MIN:.0f} min soft "
+                        f"budget. Keeping taker re-flatten running "
+                        f"automatically — <b>no manual action needed</b>.\n"
+                        f"{detail}"
+                    )
+                elif (past_soft and config.CLOSE_FLATTEN_PERSIST
+                      and last_progress_alert > 0
+                      and _time.monotonic() - last_progress_alert >= 900.0):
+                    # Heartbeat every 15 min so Telegram isn't silent forever.
+                    last_progress_alert = _time.monotonic()
+                    await notifier.send(
+                        f"<b>🔄 RE-FLATTEN STILL RUNNING</b>\n"
+                        f"Round {round_i}: {detail}"
+                    )
+
+                # Cap each maker chase to the round pause so we escalate to
+                # taker instead of burning OPTION_CHASE_DEADLINE_MIN (20m)
+                # per residual leg.
+                maker_deadline = max(0.25, float(config.CLOSE_FLATTEN_ROUND_MIN))
                 for p in residual:
                     inst = p["instrument_name"]
                     amt = float(p.get("amount", 0.0))
                     if use_taker:
                         r = await self.exchange.taker_flatten(inst, amt)
                         if r and inst in instruments:
-                            avg = float(r.get("average_price", 0.0))
+                            avg = float(r.get("average_price", 0.0) or 0.0)
                             if avg > 0:
                                 overrides[inst] = avg
                         continue
@@ -817,18 +865,27 @@ class Algo:
                         continue
                     if amt > 0:
                         initial = ticker.bid if ticker.bid > 0 else ticker.ask
-                        r = await self.exchange.chase_sell(inst, abs(amt), initial)
+                        r = await self.exchange.chase_sell(
+                            inst, abs(amt), initial,
+                            deadline_min=maker_deadline,
+                        )
                     else:
                         initial = ticker.ask if ticker.ask > 0 else ticker.bid
-                        r = await self.exchange.chase_buy(inst, abs(amt), initial)
-                    if r and r.get("order_status") != "partial" and inst in instruments:
-                        overrides[inst] = float(r.get("average_price", initial))
+                        r = await self.exchange.chase_buy(
+                            inst, abs(amt), initial,
+                            deadline_min=maker_deadline,
+                        )
+                    if (r and r.get("order_status") != "partial"
+                            and inst in instruments):
+                        avg = float(r.get("average_price", initial) or 0.0)
+                        if avg > 0:
+                            overrides[inst] = avg
 
-            if _time.monotonic() >= deadline:
+            if past_soft and not config.CLOSE_FLATTEN_PERSIST:
                 break
             await asyncio.sleep(config.CLOSE_FLATTEN_ROUND_MIN * 60.0)
 
-        # Final authoritative check.
+        # Final authoritative check (non-persist / budget-exhausted path).
         try:
             positions = await self.exchange.list_open_positions()
             flat = not any(
@@ -839,6 +896,122 @@ class Algo:
             flat = False
         return flat, overrides
 
+    async def _finalize_flat_close(
+        self, straddle, exit_call: float, exit_put: float, *,
+        equity_before: float, both_sold: bool = True,
+    ) -> None:
+        """Book P&L + Telegram once exchange flatness is confirmed."""
+        if not both_sold:
+            log.info("close_finalized_via_reflatten", id=straddle.id)
+        pnl = self.portfolio.close_straddle(
+            exit_call, exit_put, "session_close",
+        )
+
+        if not config.DRY_RUN:
+            live_equity = await self.exchange.get_subaccount_collateral()
+            if live_equity is None:
+                log.warning("close_equity_read_failed_keeping_persisted",
+                            persisted=self.portfolio.equity)
+            else:
+                self.portfolio.sync_equity(live_equity)
+
+        await notifier.notify_close(
+            pnl, "session_close",
+            straddle=straddle,
+            equity_before=equity_before,
+            equity_after=self.portfolio.equity,
+        )
+
+        actual_pnl = self.portfolio.equity - equity_before
+        if actual_pnl != 0.0:
+            cum_return = (
+                self.portfolio.equity - config.INITIAL_CAPITAL_USD
+            ) / config.INITIAL_CAPITAL_USD
+            await notifier.notify_daily_summary(
+                self.portfolio.equity, actual_pnl, cum_return,
+            )
+        self.portfolio.reset_daily()
+        log.info("session_close_done", pnl=f"${pnl:,.2f}",
+                 actual_pnl=f"${actual_pnl:,.2f}",
+                 equity=f"${self.portfolio.equity:,.2f}")
+
+    async def _resume_unclosed_straddle(self) -> None:
+        """After boot: if local state still has an open straddle AND the
+        exchange still holds residual legs, keep auto-flattening until flat
+        and then finalise the close. Covers the post-orphan case without
+        requiring force_liquidate.
+        """
+        if config.DRY_RUN or not self.portfolio.has_open:
+            return
+        if self._reflatten_active:
+            return
+        try:
+            positions = await self.exchange.list_open_positions()
+        except Exception:
+            log.warning("resume_unclosed_fetch_failed", exc_info=True)
+            return
+        residual = [
+            p for p in positions
+            if abs(float(p.get("amount", 0.0))) > 1e-9
+        ]
+        if not residual:
+            return
+
+        straddle = self.portfolio.open_straddle
+        detail = ", ".join(
+            f"{p['instrument_name']} {float(p['amount']):+.4f}"
+            for p in residual
+        )
+        log.warning("resume_unclosed_straddle",
+                    id=straddle.id, residual=detail)
+        self._set_entry_lock(
+            "Auto-flatten in progress (resume after incomplete close)",
+            clearable_when_flat=True,
+        )
+        await notifier.send(
+            f"<b>🔄 AUTO-FLATTEN RESUMED</b>\n"
+            f"Open straddle <code>{straddle.id}</code> still has exchange "
+            f"residual after a prior incomplete close.\n"
+            f"{detail}\n\n"
+            f"Continuing taker re-flatten until flat — "
+            f"<b>no manual action needed</b>."
+        )
+
+        self._reflatten_active = True
+        try:
+            equity_before = self.portfolio.equity
+            flat, overrides = await self._flatten_residual_until_flat(straddle)
+            if not flat:
+                log.error("resume_unclosed_still_not_flat", id=straddle.id)
+                return
+            exit_call = overrides.get(
+                straddle.call_leg.instrument, straddle.entry_call_price,
+            )
+            exit_put = overrides.get(
+                straddle.put_leg.instrument, straddle.entry_put_price,
+            )
+            await self._finalize_flat_close(
+                straddle, exit_call, exit_put,
+                equity_before=equity_before, both_sold=False,
+            )
+            if self._lock_clearable_when_flat:
+                prior = self._lock_reason
+                self._entry_locked = False
+                self._lock_reason = ""
+                self._lock_clearable_when_flat = False
+                await notifier.send(
+                    "<b>✅ AUTO-FLATTEN COMPLETE</b>\n"
+                    "Exchange is flat; close booked; entry lock cleared.\n"
+                    f"<i>Prior lock:</i> {prior}"
+                )
+        except Exception:
+            log.error("resume_unclosed_error", exc_info=True)
+            await notifier.notify_error(
+                "Auto-flatten", "Resume flatten failed — check logs",
+            )
+        finally:
+            self._reflatten_active = False
+
     # ──────────────────── Close ───────────────────────────────────
 
     async def _on_close(self) -> None:
@@ -846,85 +1019,63 @@ class Algo:
             if not self.portfolio.has_open:
                 log.info("close_nothing_open")
                 return
+            if self._reflatten_active:
+                log.info("close_skip_reflatten_already_active")
+                return
 
             straddle = self.portfolio.open_straddle
             equity_before = self.portfolio.equity
 
-            result = await self.exit_mgr.hard_close(reason="session_close")
-            if result is None:
-                log.info("close_nothing_open")
-                return
+            self._reflatten_active = True
+            try:
+                result = await self.exit_mgr.hard_close(reason="session_close")
+                if result is None:
+                    log.info("close_nothing_open")
+                    return
 
-            exit_call = result.exit_call_price
-            exit_put = result.exit_put_price
+                exit_call = result.exit_call_price
+                exit_put = result.exit_put_price
 
-            # ── Reconcile-then-lock ──
-            # Verify the exchange is actually flat before recording ANY close.
-            # If not, persistently re-flatten within budget; if it still is
-            # not flat, LOCK entries (orphan) rather than booking a phantom
-            # close with fabricated exit prices.
-            flat = True
-            if not config.DRY_RUN:
-                flat, overrides = await self._flatten_residual_until_flat(straddle)
-                if straddle.call_leg.instrument in overrides:
-                    exit_call = overrides[straddle.call_leg.instrument]
-                if straddle.put_leg.instrument in overrides:
-                    exit_put = overrides[straddle.put_leg.instrument]
+                # Verify exchange flatness before booking the close. Default
+                # persist=true keeps re-flattening until flat (no orphan lock).
+                flat = True
+                if not config.DRY_RUN:
+                    flat, overrides = await self._flatten_residual_until_flat(
+                        straddle,
+                    )
+                    if straddle.call_leg.instrument in overrides:
+                        exit_call = overrides[straddle.call_leg.instrument]
+                    if straddle.put_leg.instrument in overrides:
+                        exit_put = overrides[straddle.put_leg.instrument]
 
-            if not flat:
-                self._set_entry_lock(
-                    "Post-close exchange NOT flat after re-flatten budget — "
-                    "orphan; straddle kept OPEN locally, entries locked",
-                    clearable_when_flat=True,
+                if not flat:
+                    # Only reachable with CLOSE_FLATTEN_PERSIST=false.
+                    self._set_entry_lock(
+                        "Post-close exchange NOT flat after re-flatten budget — "
+                        "orphan; straddle kept OPEN locally, entries locked",
+                        clearable_when_flat=True,
+                    )
+                    log.error("post_close_not_flat_lock", id=straddle.id)
+                    await notifier.send(
+                        f"<b>⚠️ POST-CLOSE ORPHAN — ENTRIES LOCKED</b>\n"
+                        f"Straddle <code>{straddle.id}</code> could not be "
+                        f"fully flattened "
+                        f"(CLOSE_FLATTEN_PERSIST=false).\n\n"
+                        f"Local state kept OPEN. Set "
+                        f"<code>CLOSE_FLATTEN_PERSIST=true</code> (default) "
+                        f"or flatten with tools/force_liquidate.py."
+                    )
+                    return
+
+                await self._finalize_flat_close(
+                    straddle, exit_call, exit_put,
+                    equity_before=equity_before,
+                    both_sold=result.both_sold,
                 )
-                log.error("post_close_not_flat_lock", id=straddle.id)
-                await notifier.send(
-                    f"<b>⚠️ POST-CLOSE ORPHAN — ENTRIES LOCKED</b>\n"
-                    f"Straddle <code>{straddle.id}</code> could not be fully "
-                    f"flattened within the re-flatten budget.\n\n"
-                    f"Local state kept OPEN (no phantom close). "
-                    f"<b>ACTION</b>: flatten manually "
-                    f"(tools/force_liquidate.py) and restart."
-                )
-                return
-
-            # Confirmed flat → finalise the close (records P&L + trade log).
-            if not result.both_sold:
-                log.info("close_finalized_via_reflatten", id=straddle.id)
-            pnl = self.portfolio.close_straddle(
-                exit_call, exit_put, "session_close",
-            )
-
-            if not config.DRY_RUN:
-                live_equity = await self.exchange.get_subaccount_collateral()
-                if live_equity is None:
-                    log.warning("close_equity_read_failed_keeping_persisted",
-                                persisted=self.portfolio.equity)
-                else:
-                    self.portfolio.sync_equity(live_equity)
-
-            # Rich OKX-parity close (entry/exit per leg + equity delta).
-            # Sync equity BEFORE notifying so Equity: before → after is live.
-            await notifier.notify_close(
-                pnl, "session_close",
-                straddle=straddle,
-                equity_before=equity_before,
-                equity_after=self.portfolio.equity,
-            )
-
-            actual_pnl = self.portfolio.equity - equity_before
-            if actual_pnl != 0.0:
-                cum_return = (
-                    self.portfolio.equity - config.INITIAL_CAPITAL_USD
-                ) / config.INITIAL_CAPITAL_USD
-                await notifier.notify_daily_summary(
-                    self.portfolio.equity, actual_pnl, cum_return,
-                )
-            self.portfolio.reset_daily()
-            log.info("session_close_done", pnl=f"${pnl:,.2f}",
-                     actual_pnl=f"${actual_pnl:,.2f}",
-                     equity=f"${self.portfolio.equity:,.2f}")
+            finally:
+                self._reflatten_active = False
         except Exception:
+            self._reflatten_active = False
             log.error("close_error", exc_info=True)
             await notifier.notify_error("Close", "Unhandled exception — check logs")
 
